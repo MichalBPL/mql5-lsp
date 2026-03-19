@@ -1,68 +1,105 @@
-use regex::Regex;
+//! Cross-file symbol index.
+//!
+//! Indexes all symbols from workspace files, included files, and builtins.
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
 use tower_lsp::lsp_types::*;
 
-/// A symbol found in the workspace via regex scanning.
+use crate::parser::{self, ParsedSymbol, ParsedSymbolKind};
+
+/// A symbol in the index.
 #[derive(Clone, Debug)]
 pub struct SymbolInfo {
     pub name: String,
-    pub kind: SymbolType,
+    pub kind: ParsedSymbolKind,
     pub detail: String,
     pub uri: Url,
     pub range: Range,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum SymbolType {
-    Function,
-    Class,
-    Struct,
-    Enum,
-    EnumValue,
-    Define,
-    InputVar,
-    GlobalVar,
+    /// For class/struct members, the parent type name
+    pub parent_name: Option<String>,
 }
 
 impl SymbolInfo {
     pub fn symbol_kind(&self) -> SymbolKind {
         match self.kind {
-            SymbolType::Function => SymbolKind::FUNCTION,
-            SymbolType::Class => SymbolKind::CLASS,
-            SymbolType::Struct => SymbolKind::STRUCT,
-            SymbolType::Enum => SymbolKind::ENUM,
-            SymbolType::EnumValue => SymbolKind::ENUM_MEMBER,
-            SymbolType::Define => SymbolKind::CONSTANT,
-            SymbolType::InputVar => SymbolKind::PROPERTY,
-            SymbolType::GlobalVar => SymbolKind::VARIABLE,
+            ParsedSymbolKind::Function => SymbolKind::FUNCTION,
+            ParsedSymbolKind::Class => SymbolKind::CLASS,
+            ParsedSymbolKind::Struct => SymbolKind::STRUCT,
+            ParsedSymbolKind::Enum => SymbolKind::ENUM,
+            ParsedSymbolKind::EnumValue => SymbolKind::ENUM_MEMBER,
+            ParsedSymbolKind::Define => SymbolKind::CONSTANT,
+            ParsedSymbolKind::InputVar => SymbolKind::PROPERTY,
+            ParsedSymbolKind::GlobalVar => SymbolKind::VARIABLE,
+            ParsedSymbolKind::Method => SymbolKind::METHOD,
+            ParsedSymbolKind::Field => SymbolKind::FIELD,
+            ParsedSymbolKind::TypeAlias => SymbolKind::TYPE_PARAMETER,
         }
     }
 
     pub fn completion_kind(&self) -> CompletionItemKind {
         match self.kind {
-            SymbolType::Function => CompletionItemKind::FUNCTION,
-            SymbolType::Class => CompletionItemKind::CLASS,
-            SymbolType::Struct => CompletionItemKind::STRUCT,
-            SymbolType::Enum => CompletionItemKind::ENUM,
-            SymbolType::EnumValue => CompletionItemKind::ENUM_MEMBER,
-            SymbolType::Define => CompletionItemKind::CONSTANT,
-            SymbolType::InputVar => CompletionItemKind::PROPERTY,
-            SymbolType::GlobalVar => CompletionItemKind::VARIABLE,
+            ParsedSymbolKind::Function => CompletionItemKind::FUNCTION,
+            ParsedSymbolKind::Class => CompletionItemKind::CLASS,
+            ParsedSymbolKind::Struct => CompletionItemKind::STRUCT,
+            ParsedSymbolKind::Enum => CompletionItemKind::ENUM,
+            ParsedSymbolKind::EnumValue => CompletionItemKind::ENUM_MEMBER,
+            ParsedSymbolKind::Define => CompletionItemKind::CONSTANT,
+            ParsedSymbolKind::InputVar => CompletionItemKind::PROPERTY,
+            ParsedSymbolKind::GlobalVar => CompletionItemKind::VARIABLE,
+            ParsedSymbolKind::Method => CompletionItemKind::METHOD,
+            ParsedSymbolKind::Field => CompletionItemKind::FIELD,
+            ParsedSymbolKind::TypeAlias => CompletionItemKind::TYPE_PARAMETER,
         }
     }
 }
 
-/// Holds all symbols found in the workspace.
-pub struct WorkspaceSymbols {
+/// Workspace-wide symbol index.
+pub struct SymbolIndex {
     /// file path -> symbols in that file
     files: HashMap<PathBuf, Vec<SymbolInfo>>,
 }
 
-impl WorkspaceSymbols {
+impl SymbolIndex {
     pub fn new() -> Self {
         Self {
             files: HashMap::new(),
+        }
+    }
+
+    /// Index a file from source content.
+    pub fn index_file(&mut self, path: &Path, source: &str) {
+        let uri = match Url::from_file_path(path) {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+
+        let tree = match parser::parse(source) {
+            Some(t) => t,
+            None => return,
+        };
+
+        let parsed = parser::extract_symbols(source, &tree);
+        let symbols: Vec<SymbolInfo> = parsed
+            .into_iter()
+            .map(|p| to_symbol_info(p, &uri))
+            .collect();
+
+        if symbols.is_empty() {
+            self.files.remove(path);
+        } else {
+            self.files.insert(path.to_path_buf(), symbols);
+        }
+    }
+
+    /// Index a file by reading it from disk.
+    pub fn index_file_from_disk(&mut self, path: &Path) {
+        if !is_mql5_file(path) {
+            return;
+        }
+        if let Ok(source) = std::fs::read_to_string(path) {
+            self.index_file(path, &source);
         }
     }
 
@@ -76,7 +113,7 @@ impl WorkspaceSymbols {
 
     fn scan_dir_recursive(&mut self, dir: &Path, depth: u32) {
         if depth > 10 {
-            return; // Safety limit
+            return;
         }
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
@@ -86,44 +123,104 @@ impl WorkspaceSymbols {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Skip hidden directories and common non-source dirs
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 if name.starts_with('.') || name == "node_modules" || name == "target" {
                     continue;
                 }
                 self.scan_dir_recursive(&path, depth + 1);
             } else if is_mql5_file(&path) {
-                let symbols = parse_file_symbols(&path);
-                if !symbols.is_empty() {
-                    self.files.insert(path, symbols);
-                }
+                self.index_file_from_disk(&path);
             }
         }
     }
 
-    /// Re-scan a single file (on save or open).
-    pub fn rescan_file(&mut self, path: &Path) {
-        if is_mql5_file(path) {
-            let symbols = parse_file_symbols(path);
-            if symbols.is_empty() {
-                self.files.remove(path);
-            } else {
-                self.files.insert(path.to_path_buf(), symbols);
-            }
+    /// Re-index a single file.
+    pub fn rescan_file(&mut self, path: &Path, source: Option<&str>) {
+        if !is_mql5_file(path) {
+            return;
+        }
+        match source {
+            Some(s) => self.index_file(path, s),
+            None => self.index_file_from_disk(path),
         }
     }
 
-    /// Iterate over all symbols in the workspace.
+    /// Get all symbols across all files.
     pub fn all_symbols(&self) -> impl Iterator<Item = &SymbolInfo> {
         self.files.values().flat_map(|v| v.iter())
     }
 
-    /// Find the first symbol matching a name.
+    /// Get symbols for a specific file.
+    pub fn file_symbols(&self, path: &Path) -> Option<&[SymbolInfo]> {
+        self.files.get(path).map(|v| v.as_slice())
+    }
+
+    /// Find symbol(s) by name across all files.
     pub fn find_symbol(&self, name: &str) -> Option<&SymbolInfo> {
         self.files
             .values()
             .flat_map(|v| v.iter())
             .find(|s| s.name == name)
+    }
+
+    /// Find all symbols matching a name.
+    pub fn find_symbols(&self, name: &str) -> Vec<&SymbolInfo> {
+        self.files
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|s| s.name == name)
+            .collect()
+    }
+
+    /// Find all members of a class/struct.
+    pub fn find_members(&self, class_name: &str) -> Vec<&SymbolInfo> {
+        self.files
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|s| s.parent_name.as_deref() == Some(class_name))
+            .collect()
+    }
+
+    /// Find top-level symbols (no parent) matching a filter.
+    pub fn find_top_level<F>(&self, filter: F) -> Vec<&SymbolInfo>
+    where
+        F: Fn(&SymbolInfo) -> bool,
+    {
+        self.files
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|s| s.parent_name.is_none() && filter(s))
+            .collect()
+    }
+
+    /// Number of indexed files.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    /// Total number of symbols.
+    pub fn symbol_count(&self) -> usize {
+        self.files.values().map(|v| v.len()).sum()
+    }
+}
+
+fn to_symbol_info(parsed: ParsedSymbol, uri: &Url) -> SymbolInfo {
+    SymbolInfo {
+        name: parsed.name,
+        kind: parsed.kind,
+        detail: parsed.detail,
+        uri: uri.clone(),
+        range: Range {
+            start: Position {
+                line: parsed.start_line,
+                character: 0,
+            },
+            end: Position {
+                line: parsed.end_line,
+                character: 1000,
+            },
+        },
+        parent_name: parsed.parent_name,
     }
 }
 
@@ -132,138 +229,4 @@ fn is_mql5_file(path: &Path) -> bool {
         path.extension().and_then(|e| e.to_str()),
         Some("mq5" | "mqh")
     )
-}
-
-/// Parse a single file for symbols using regex patterns.
-pub fn parse_file_symbols(path: &Path) -> Vec<SymbolInfo> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-
-    let uri = match Url::from_file_path(path) {
-        Ok(u) => u,
-        Err(_) => return vec![],
-    };
-
-    let mut symbols = Vec::new();
-
-    // Regex patterns for MQL5 symbols
-    let re_function = Regex::new(
-        r"(?m)^\s*(?:virtual\s+)?(?:static\s+)?(\w[\w\s*&]*?)\s+(\w+)\s*\(([^)]*)\)\s*(?:const\s*)?[{;]"
-    ).unwrap();
-
-    let re_class = Regex::new(r"(?m)^\s*class\s+(\w+)").unwrap();
-    let re_struct = Regex::new(r"(?m)^\s*struct\s+(\w+)").unwrap();
-    let re_enum = Regex::new(r"(?m)^\s*enum\s+(\w+)").unwrap();
-    let re_define = Regex::new(r"(?m)^#define\s+(\w+)").unwrap();
-    let re_input = Regex::new(r"(?m)^\s*(?:input|sinput)\s+(\w+)\s+(\w+)").unwrap();
-
-    for cap in re_function.captures_iter(&content) {
-        let return_type = cap[1].trim();
-        let name = &cap[2];
-        let params = cap[3].trim();
-
-        // Skip common false positives
-        if matches!(name, "if" | "for" | "while" | "switch" | "return" | "else" | "do") {
-            continue;
-        }
-
-        let line = line_of_offset(&content, cap.get(0).unwrap().start());
-        symbols.push(SymbolInfo {
-            name: name.to_string(),
-            kind: SymbolType::Function,
-            detail: format!("{} {}({})", return_type, name, truncate(params, 60)),
-            uri: uri.clone(),
-            range: line_range(line),
-        });
-    }
-
-    for cap in re_class.captures_iter(&content) {
-        let name = &cap[1];
-        let line = line_of_offset(&content, cap.get(0).unwrap().start());
-        symbols.push(SymbolInfo {
-            name: name.to_string(),
-            kind: SymbolType::Class,
-            detail: format!("class {}", name),
-            uri: uri.clone(),
-            range: line_range(line),
-        });
-    }
-
-    for cap in re_struct.captures_iter(&content) {
-        let name = &cap[1];
-        let line = line_of_offset(&content, cap.get(0).unwrap().start());
-        symbols.push(SymbolInfo {
-            name: name.to_string(),
-            kind: SymbolType::Struct,
-            detail: format!("struct {}", name),
-            uri: uri.clone(),
-            range: line_range(line),
-        });
-    }
-
-    for cap in re_enum.captures_iter(&content) {
-        let name = &cap[1];
-        let line = line_of_offset(&content, cap.get(0).unwrap().start());
-        symbols.push(SymbolInfo {
-            name: name.to_string(),
-            kind: SymbolType::Enum,
-            detail: format!("enum {}", name),
-            uri: uri.clone(),
-            range: line_range(line),
-        });
-    }
-
-    for cap in re_define.captures_iter(&content) {
-        let name = &cap[1];
-        let line = line_of_offset(&content, cap.get(0).unwrap().start());
-        symbols.push(SymbolInfo {
-            name: name.to_string(),
-            kind: SymbolType::Define,
-            detail: format!("#define {}", name),
-            uri: uri.clone(),
-            range: line_range(line),
-        });
-    }
-
-    for cap in re_input.captures_iter(&content) {
-        let type_name = &cap[1];
-        let var_name = &cap[2];
-        let line = line_of_offset(&content, cap.get(0).unwrap().start());
-        symbols.push(SymbolInfo {
-            name: var_name.to_string(),
-            kind: SymbolType::InputVar,
-            detail: format!("input {} {}", type_name, var_name),
-            uri: uri.clone(),
-            range: line_range(line),
-        });
-    }
-
-    symbols
-}
-
-fn line_of_offset(content: &str, offset: usize) -> u32 {
-    content[..offset].chars().filter(|c| *c == '\n').count() as u32
-}
-
-fn line_range(line: u32) -> Range {
-    Range {
-        start: Position {
-            line,
-            character: 0,
-        },
-        end: Position {
-            line,
-            character: 1000,
-        },
-    }
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
 }
