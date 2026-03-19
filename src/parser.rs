@@ -561,6 +561,91 @@ fn is_ident_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+// ── Identifier extraction (for references) ──
+
+/// Extract all identifier usages from a parsed tree.
+/// Returns (name, line, start_col, end_col) tuples.
+pub fn extract_identifiers(source: &str, tree: &Tree) -> Vec<(String, u32, u32, u32)> {
+    let mut identifiers = Vec::new();
+    collect_identifiers(tree.root_node(), source, &mut identifiers);
+    identifiers
+}
+
+fn collect_identifiers(node: Node, source: &str, out: &mut Vec<(String, u32, u32, u32)>) {
+    match node.kind() {
+        "identifier" | "field_identifier" | "type_identifier" => {
+            let text = &source[node.byte_range()];
+            // Skip empty or whitespace-only nodes
+            if !text.is_empty() && text.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                let start = node.start_position();
+                let end = node.end_position();
+                out.push((
+                    text.to_string(),
+                    start.row as u32,
+                    start.column as u32,
+                    end.column as u32,
+                ));
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_identifiers(child, source, out);
+    }
+}
+
+// ── Error node extraction (for diagnostics) ──
+
+/// A syntax error found by tree-sitter.
+#[derive(Clone, Debug)]
+pub struct SyntaxError {
+    pub message: String,
+    pub start_line: u32,
+    pub start_col: u32,
+    pub end_line: u32,
+    pub end_col: u32,
+}
+
+/// Extract all ERROR and MISSING nodes from the parse tree.
+pub fn extract_errors(source: &str, tree: &Tree) -> Vec<SyntaxError> {
+    let mut errors = Vec::new();
+    collect_errors(tree.root_node(), source, &mut errors);
+    errors
+}
+
+fn collect_errors(node: Node, source: &str, out: &mut Vec<SyntaxError>) {
+    if node.is_error() {
+        let text = &source[node.byte_range()];
+        let preview: String = text.chars().take(40).collect();
+        let start = node.start_position();
+        let end = node.end_position();
+        out.push(SyntaxError {
+            message: format!("Syntax error near `{}`", preview.trim()),
+            start_line: start.row as u32,
+            start_col: start.column as u32,
+            end_line: end.row as u32,
+            end_col: end.column as u32,
+        });
+    } else if node.is_missing() {
+        let start = node.start_position();
+        let end = node.end_position();
+        out.push(SyntaxError {
+            message: format!("Missing `{}`", node.kind()),
+            start_line: start.row as u32,
+            start_col: start.column as u32,
+            end_line: end.row as u32,
+            end_col: end.column as u32,
+        });
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_errors(child, source, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

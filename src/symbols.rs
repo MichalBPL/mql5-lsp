@@ -1,6 +1,7 @@
 //! Cross-file symbol index.
 //!
 //! Indexes all symbols from workspace files, included files, and builtins.
+//! Also tracks identifier references (usages) for find-all-references and rename.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -55,20 +56,31 @@ impl SymbolInfo {
     }
 }
 
+/// A reference (usage) of an identifier in source code.
+#[derive(Clone, Debug)]
+pub struct ReferenceInfo {
+    pub name: String,
+    pub uri: Url,
+    pub range: Range,
+}
+
 /// Workspace-wide symbol index.
 pub struct SymbolIndex {
     /// file path -> symbols in that file
     files: HashMap<PathBuf, Vec<SymbolInfo>>,
+    /// file path -> references (identifier usages) in that file
+    references: HashMap<PathBuf, Vec<ReferenceInfo>>,
 }
 
 impl SymbolIndex {
     pub fn new() -> Self {
         Self {
             files: HashMap::new(),
+            references: HashMap::new(),
         }
     }
 
-    /// Index a file from source content.
+    /// Index a file from source content — extracts both definitions and references.
     pub fn index_file(&mut self, path: &Path, source: &str) {
         let uri = match Url::from_file_path(path) {
             Ok(u) => u,
@@ -80,6 +92,7 @@ impl SymbolIndex {
             None => return,
         };
 
+        // Extract symbol definitions
         let parsed = parser::extract_symbols(source, &tree);
         let symbols: Vec<SymbolInfo> = parsed
             .into_iter()
@@ -90,6 +103,32 @@ impl SymbolIndex {
             self.files.remove(path);
         } else {
             self.files.insert(path.to_path_buf(), symbols);
+        }
+
+        // Extract identifier references (usages)
+        let idents = parser::extract_identifiers(source, &tree);
+        let refs: Vec<ReferenceInfo> = idents
+            .into_iter()
+            .map(|(name, row, col, end_col)| ReferenceInfo {
+                name,
+                uri: uri.clone(),
+                range: Range {
+                    start: Position {
+                        line: row,
+                        character: col,
+                    },
+                    end: Position {
+                        line: row,
+                        character: end_col,
+                    },
+                },
+            })
+            .collect();
+
+        if refs.is_empty() {
+            self.references.remove(path);
+        } else {
+            self.references.insert(path.to_path_buf(), refs);
         }
     }
 
@@ -151,6 +190,7 @@ impl SymbolIndex {
     }
 
     /// Get symbols for a specific file.
+    #[allow(dead_code)]
     pub fn file_symbols(&self, path: &Path) -> Option<&[SymbolInfo]> {
         self.files.get(path).map(|v| v.as_slice())
     }
@@ -172,6 +212,15 @@ impl SymbolIndex {
             .collect()
     }
 
+    /// Find all references (usages) of a name across all indexed files.
+    pub fn find_references(&self, name: &str) -> Vec<&ReferenceInfo> {
+        self.references
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|r| r.name == name)
+            .collect()
+    }
+
     /// Find all members of a class/struct.
     pub fn find_members(&self, class_name: &str) -> Vec<&SymbolInfo> {
         self.files
@@ -182,6 +231,7 @@ impl SymbolIndex {
     }
 
     /// Find top-level symbols (no parent) matching a filter.
+    #[allow(dead_code)]
     pub fn find_top_level<F>(&self, filter: F) -> Vec<&SymbolInfo>
     where
         F: Fn(&SymbolInfo) -> bool,

@@ -4,6 +4,7 @@ mod includes;
 mod parser;
 mod symbols;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -15,7 +16,7 @@ use builtins::*;
 use documents::DocumentStore;
 use includes::IncludeResolver;
 use parser::CompletionContext;
-use symbols::{SymbolIndex, SymbolInfo};
+use symbols::SymbolIndex;
 
 struct Mql5Lsp {
     client: Client,
@@ -73,6 +74,20 @@ impl LanguageServer for Mql5Lsp {
                 document_symbol_provider: Some(OneOf::Left(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: None,
+                    },
+                })),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: None,
+                    work_done_progress_options: WorkDoneProgressOptions {
+                        work_done_progress: None,
+                    },
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -106,6 +121,9 @@ impl LanguageServer for Mql5Lsp {
             // Also index included files
             self.index_includes(&path, &text, &mut index).await;
         }
+
+        // Publish diagnostics
+        self.publish_diagnostics_for(&uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -137,9 +155,16 @@ impl LanguageServer for Mql5Lsp {
                 .unwrap_or_default();
             self.index_includes(&path, &source, &mut index).await;
         }
+
+        // Publish diagnostics on save
+        self.publish_diagnostics_for(&uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        // Clear diagnostics when closing
+        self.client
+            .publish_diagnostics(params.text_document.uri.clone(), vec![], None)
+            .await;
         self.documents.close(&params.text_document.uri);
     }
 
@@ -314,6 +339,252 @@ impl LanguageServer for Mql5Lsp {
         Ok(Some(GotoDefinitionResponse::Array(locations)))
     }
 
+    // ── Find All References ──
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let line = pos.line as usize;
+        let col = pos.character as usize;
+
+        let source = self.get_source(uri);
+        let word = source.and_then(|s| parser::extract_word_at(&s, line, col));
+
+        let word = match word {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+
+        let index = self.index.read().await;
+        let mut locations: Vec<Location> = Vec::new();
+
+        // Include definitions if requested
+        if params.context.include_declaration {
+            for sym in index.find_symbols(&word) {
+                locations.push(Location {
+                    uri: sym.uri.clone(),
+                    range: sym.range,
+                });
+            }
+        }
+
+        // Include all references (usages)
+        for reference in index.find_references(&word) {
+            let loc = Location {
+                uri: reference.uri.clone(),
+                range: reference.range,
+            };
+            // Avoid duplicates with definitions
+            if !locations.iter().any(|l| l.uri == loc.uri && l.range == loc.range) {
+                locations.push(loc);
+            }
+        }
+
+        if locations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(locations))
+        }
+    }
+
+    // ── Rename ──
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = &params.text_document.uri;
+        let pos = params.position;
+        let line = pos.line as usize;
+        let col = pos.character as usize;
+
+        let source = self.get_source(uri);
+        let source = match source {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Find the word at cursor and its range
+        let target_line = match source.lines().nth(line) {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        let bytes = target_line.as_bytes();
+        if col >= bytes.len() {
+            return Ok(None);
+        }
+
+        let mut start = col;
+        while start > 0 && is_ident_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end < bytes.len() && is_ident_byte(bytes[end]) {
+            end += 1;
+        }
+
+        if start == end {
+            return Ok(None);
+        }
+
+        let word = &target_line[start..end];
+
+        // Check that the symbol exists (either as a definition or a reference)
+        let index = self.index.read().await;
+        let has_definition = !index.find_symbols(word).is_empty();
+        let has_references = !index.find_references(word).is_empty();
+
+        if !has_definition && !has_references {
+            // Also check builtins — we cannot rename builtins
+            if find_function(word).is_some()
+                || find_enum(word).is_some()
+                || find_struct(word).is_some()
+                || find_constant(word).is_some()
+            {
+                return Ok(None); // Cannot rename builtins
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(PrepareRenameResponse::Range(Range {
+            start: Position {
+                line: pos.line,
+                character: start as u32,
+            },
+            end: Position {
+                line: pos.line,
+                character: end as u32,
+            },
+        })))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let line = pos.line as usize;
+        let col = pos.character as usize;
+        let new_name = &params.new_name;
+
+        let source = self.get_source(uri);
+        let word = source.and_then(|s| parser::extract_word_at(&s, line, col));
+
+        let word = match word {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+
+        let index = self.index.read().await;
+
+        // Collect all locations to rename: definitions + references
+        let mut file_edits: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+
+        // Definitions
+        for sym in index.find_symbols(&word) {
+            file_edits
+                .entry(sym.uri.clone())
+                .or_default()
+                .push(TextEdit {
+                    range: sym.range,
+                    new_text: new_name.clone(),
+                });
+        }
+
+        // References
+        for reference in index.find_references(&word) {
+            file_edits
+                .entry(reference.uri.clone())
+                .or_default()
+                .push(TextEdit {
+                    range: reference.range,
+                    new_text: new_name.clone(),
+                });
+        }
+
+        if file_edits.is_empty() {
+            return Ok(None);
+        }
+
+        let changes: HashMap<Url, Vec<TextEdit>> = file_edits;
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }))
+    }
+
+    // ── Signature Help ──
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let line = pos.line as usize;
+        let col = pos.character as usize;
+
+        let source = match self.get_source(uri) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Find function name and active parameter by scanning backwards from cursor
+        let (func_name, active_param) = match find_function_call_context(&source, line, col) {
+            Some(ctx) => ctx,
+            None => return Ok(None),
+        };
+
+        // Look up the function signature
+        let signature_str;
+        let doc_str;
+
+        if let Some(func) = find_function(&func_name) {
+            signature_str = func.signature.to_string();
+            doc_str = func.doc.map(|d| d.to_string());
+        } else {
+            // Check workspace symbols
+            let index = self.index.read().await;
+            let sym = index.find_symbol(&func_name);
+            match sym {
+                Some(s)
+                    if matches!(
+                        s.kind,
+                        parser::ParsedSymbolKind::Function | parser::ParsedSymbolKind::Method
+                    ) =>
+                {
+                    signature_str = s.detail.clone();
+                    doc_str = None;
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Parse parameters from signature
+        let params_list = parse_signature_params(&signature_str);
+
+        let param_infos: Vec<ParameterInformation> = params_list
+            .iter()
+            .map(|p| ParameterInformation {
+                label: ParameterLabel::Simple(p.clone()),
+                documentation: None,
+            })
+            .collect();
+
+        let sig = SignatureInformation {
+            label: signature_str,
+            documentation: doc_str.map(|d| {
+                Documentation::MarkupContent(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: d,
+                })
+            }),
+            parameters: Some(param_infos),
+            active_parameter: Some(active_param as u32),
+        };
+
+        Ok(Some(SignatureHelp {
+            signatures: vec![sig],
+            active_signature: Some(0),
+            active_parameter: Some(active_param as u32),
+        }))
+    }
+
     // ── Document Symbols ──
 
     async fn document_symbol(
@@ -445,6 +716,108 @@ impl Mql5Lsp {
         }
     }
 
+    /// Publish diagnostics for a document.
+    async fn publish_diagnostics_for(&self, uri: &Url) {
+        let source = match self.get_source(uri) {
+            Some(s) => s,
+            None => return,
+        };
+
+        let tree = match parser::parse(&source) {
+            Some(t) => t,
+            None => return,
+        };
+
+        let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+        // (a) Syntax errors from tree-sitter ERROR/MISSING nodes
+        let errors = parser::extract_errors(&source, &tree);
+        for err in errors {
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: err.start_line,
+                        character: err.start_col,
+                    },
+                    end: Position {
+                        line: err.end_line,
+                        character: err.end_col,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::ERROR),
+                source: Some("mql5-lsp".to_string()),
+                message: err.message,
+                ..Default::default()
+            });
+        }
+
+        // (c) Unresolved includes
+        let includes = parser::extract_includes(&source, &tree);
+        if let Ok(path) = uri.to_file_path() {
+            let mut resolver = self.include_resolver.write().await;
+            for inc in &includes {
+                if resolver.resolve(inc, &path).is_none() {
+                    let line = inc.line;
+                    diagnostics.push(Diagnostic {
+                        range: Range {
+                            start: Position {
+                                line,
+                                character: 0,
+                            },
+                            end: Position {
+                                line,
+                                character: 1000,
+                            },
+                        },
+                        severity: Some(DiagnosticSeverity::ERROR),
+                        source: Some("mql5-lsp".to_string()),
+                        message: format!("Unresolved include: {}", inc.path),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        // (d) Duplicate definitions within the same file
+        {
+            let parsed = parser::extract_symbols(&source, &tree);
+            let mut seen: HashMap<String, u32> = HashMap::new();
+            for sym in &parsed {
+                // Only check top-level symbols (no parent) and non-methods
+                if sym.parent_name.is_none() {
+                    if let Some(prev_line) = seen.get(&sym.name) {
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: sym.start_line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: sym.start_line,
+                                    character: 1000,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("mql5-lsp".to_string()),
+                            message: format!(
+                                "Duplicate definition of `{}` (first defined on line {})",
+                                sym.name,
+                                prev_line + 1
+                            ),
+                            ..Default::default()
+                        });
+                    } else {
+                        seen.insert(sym.name.clone(), sym.start_line);
+                    }
+                }
+            }
+        }
+
+        self.client
+            .publish_diagnostics(uri.clone(), diagnostics, None)
+            .await;
+    }
+
     /// Completion after `.` — show members of the type.
     async fn complete_dot_access(
         &self,
@@ -515,7 +888,7 @@ impl Mql5Lsp {
     }
 
     /// General completion — show all available symbols.
-    async fn complete_general(&self, uri: &Url, items: &mut Vec<CompletionItem>) {
+    async fn complete_general(&self, _uri: &Url, items: &mut Vec<CompletionItem>) {
         // Builtin functions
         for func in BUILTIN_FUNCTIONS {
             items.push(CompletionItem {
@@ -610,12 +983,13 @@ impl Mql5Lsp {
     async fn resolve_variable_type(
         &self,
         var_name: &str,
-        uri: &Url,
+        _uri: &Url,
         source: &str,
     ) -> Option<String> {
         // Simple heuristic: search for "Type var_name" pattern in source
         for line in source.lines() {
             let trimmed = line.trim();
+
             // Match patterns like: ClassName var_name; or ClassName* var_name;
             let parts: Vec<&str> = trimmed.split_whitespace().collect();
             if parts.len() >= 2 {
@@ -632,6 +1006,40 @@ impl Mql5Lsp {
                         || is_builtin_type(type_name)
                     {
                         return Some(type_name.to_string());
+                    }
+                }
+            }
+
+            // Match `var = new ClassName(...)` pattern
+            if let Some(after_eq) = trimmed.strip_prefix(&format!("{} =", var_name))
+                .or_else(|| trimmed.strip_prefix(&format!("{} =", var_name)))
+            {
+                let rhs = after_eq.trim().trim_start_matches('=').trim();
+                if let Some(rest) = rhs.strip_prefix("new ") {
+                    let class_name = rest.split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .next()
+                        .unwrap_or("");
+                    if !class_name.is_empty() {
+                        return Some(class_name.to_string());
+                    }
+                }
+            }
+
+            // Match `var = SomeFunction(...)` — look up function return type
+            if parts.len() >= 4 && parts[1] == var_name && parts[2] == "=" {
+                let rhs = parts[3..].join(" ");
+                if let Some(paren_pos) = rhs.find('(') {
+                    let func_name = &rhs[..paren_pos];
+                    if !func_name.is_empty() && func_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                        // Look up the function's return type from builtins
+                        if let Some(func) = find_function(func_name) {
+                            let ret_type = func.signature.split_whitespace().next();
+                            if let Some(t) = ret_type {
+                                if t != "void" {
+                                    return Some(t.to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -655,6 +1063,8 @@ impl Mql5Lsp {
     }
 }
 
+// ── Free functions ──
+
 fn make_hover(value: String) -> Hover {
     Hover {
         contents: HoverContents::Markup(MarkupContent {
@@ -663,6 +1073,134 @@ fn make_hover(value: String) -> Hover {
         }),
         range: None,
     }
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Scan backwards from (line, col) to find the enclosing function call name
+/// and count commas to determine the active parameter index.
+fn find_function_call_context(source: &str, line: usize, col: usize) -> Option<(String, usize)> {
+    let lines: Vec<&str> = source.lines().collect();
+    if line >= lines.len() {
+        return None;
+    }
+
+    // Build the text from the start of the file to the cursor position
+    let mut text = String::new();
+    for (i, l) in lines.iter().enumerate() {
+        if i < line {
+            text.push_str(l);
+            text.push('\n');
+        } else if i == line {
+            let end = col.min(l.len());
+            text.push_str(&l[..end]);
+        }
+    }
+
+    // Scan backwards from the end of `text` to find the matching open paren
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut comma_count = 0usize;
+    let mut paren_pos = None;
+
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b')' => depth += 1,
+            b'(' => {
+                if depth == 0 {
+                    paren_pos = Some(i);
+                    break;
+                }
+                depth -= 1;
+            }
+            b',' if depth == 0 => {
+                comma_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let paren_pos = paren_pos?;
+
+    // Extract the function name immediately before the open paren
+    let before_paren = &text[..paren_pos];
+    let trimmed = before_paren.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Walk backwards from end of trimmed to find identifier
+    let tb = trimmed.as_bytes();
+    let end = tb.len();
+    let mut start = end;
+    while start > 0 && is_ident_byte(tb[start - 1]) {
+        start -= 1;
+    }
+
+    if start == end {
+        return None;
+    }
+
+    let func_name = &trimmed[start..end];
+    Some((func_name.to_string(), comma_count))
+}
+
+/// Parse parameter strings from a function signature like "void Foo(int a, string b)".
+fn parse_signature_params(signature: &str) -> Vec<String> {
+    // Find the content between first ( and last )
+    let start = match signature.find('(') {
+        Some(p) => p + 1,
+        None => return Vec::new(),
+    };
+    let end = match signature.rfind(')') {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    if start >= end {
+        return Vec::new();
+    }
+
+    let params_str = &signature[start..end];
+
+    // Split by commas (respecting nested parens/brackets)
+    let mut params = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+
+    for ch in params_str.chars() {
+        match ch {
+            '(' | '<' | '[' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' | '>' | ']' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    params.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        params.push(trimmed);
+    }
+
+    params
 }
 
 #[tokio::main]
