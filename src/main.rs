@@ -101,6 +101,8 @@ impl LanguageServer for Mql5Lsp {
                         work_done_progress: None,
                     },
                 }),
+                inlay_hint_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -598,6 +600,129 @@ impl LanguageServer for Mql5Lsp {
         }))
     }
 
+    // ── Inlay Hints ──
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.get_source(uri) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let tree = match parser::parse(&source) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let range = params.range;
+        let mut hints: Vec<InlayHint> = Vec::new();
+
+        // Show return types for function definitions
+        let symbols = parser::extract_symbols(&source, &tree);
+        for sym in &symbols {
+            // Only within the requested range
+            if sym.start_line < range.start.line || sym.start_line > range.end.line {
+                continue;
+            }
+
+            // For function calls that return a value assigned to a variable,
+            // show the return type as an inlay hint
+            match sym.kind {
+                parser::ParsedSymbolKind::InputVar | parser::ParsedSymbolKind::Field => {
+                    // Show type for variable declarations where type might not be obvious
+                    // Skip — type is already visible in declaration
+                }
+                _ => {}
+            }
+        }
+
+        // Show parameter names at call sites for builtin functions
+        let calls = parser::extract_function_calls(&source, &tree);
+        for call in &calls {
+            if call.line < range.start.line || call.line > range.end.line {
+                continue;
+            }
+            if call.is_method {
+                continue;
+            }
+
+            if let Some(func) = find_function(&call.name) {
+                let params_list = parse_signature_params(func.signature);
+                // Show parameter name hints for calls with 2+ args
+                if params_list.len() >= 2 && call.arg_count >= 2 {
+                    // Extract argument positions from source
+                    let call_args = parser::extract_call_arg_positions(&source, &tree, call.line, call.col);
+                    for (i, (arg_line, arg_col)) in call_args.iter().enumerate() {
+                        if i >= params_list.len() {
+                            break;
+                        }
+                        // Extract just the parameter name from "type name" or "type name = default"
+                        let param = &params_list[i];
+                        let param_name = param
+                            .split('=').next().unwrap_or(param)
+                            .trim()
+                            .split_whitespace().last()
+                            .unwrap_or("")
+                            .trim_start_matches('&')
+                            .trim_start_matches('*');
+                        if param_name.is_empty() || param_name == "..." {
+                            continue;
+                        }
+                        hints.push(InlayHint {
+                            position: Position {
+                                line: *arg_line,
+                                character: *arg_col,
+                            },
+                            label: InlayHintLabel::String(format!("{}:", param_name)),
+                            kind: Some(InlayHintKind::PARAMETER),
+                            text_edits: None,
+                            tooltip: None,
+                            padding_left: Some(false),
+                            padding_right: Some(true),
+                            data: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        if hints.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(hints))
+        }
+    }
+
+    // ── Code Actions ──
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+        // Check if any diagnostic in range is an unresolved include
+        for diag in &params.context.diagnostics {
+            if diag.source.as_deref() == Some("mql5-lsp")
+                && diag.message.starts_with("Unresolved include:")
+            {
+                // Suggest creating the file
+                let include_path = diag.message.strip_prefix("Unresolved include: ").unwrap_or("");
+                if !include_path.is_empty() {
+                    actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                        title: format!("Create {}", include_path),
+                        kind: Some(CodeActionKind::QUICKFIX),
+                        diagnostics: Some(vec![diag.clone()]),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
+    }
+
     // ── Document Symbols ──
 
     async fn document_symbol(
@@ -867,8 +992,39 @@ impl Mql5Lsp {
                     continue;
                 }
 
-                // Skip method calls — we can't reliably resolve receiver types
+                // For method calls, try to resolve the receiver type and check members
                 if call.is_method {
+                    if let Some(ref receiver) = call.receiver {
+                        // Resolve receiver type
+                        if let Some(type_name) = parser::resolve_type_at(
+                            &source, &tree, receiver, call.line as usize,
+                        ) {
+                            // Check if method exists on that type
+                            let members = index.find_members(&type_name);
+                            let has_method = members.iter().any(|m| m.name == call.name);
+                            if !has_method {
+                                // Also check builtin struct fields
+                                let has_builtin = find_struct(&type_name)
+                                    .map(|s| s.fields.iter().any(|(f, _)| *f == call.name))
+                                    .unwrap_or(false);
+                                if !has_builtin {
+                                    diagnostics.push(Diagnostic {
+                                        range: Range {
+                                            start: Position { line: call.line, character: call.col },
+                                            end: Position { line: call.line, character: call.col + call.name.len() as u32 },
+                                        },
+                                        severity: Some(DiagnosticSeverity::HINT),
+                                        source: Some("mql5-lsp".to_string()),
+                                        message: format!(
+                                            "Method `{}` not found on type `{}`",
+                                            call.name, type_name
+                                        ),
+                                        ..Default::default()
+                                    });
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
                 // Skip known types/constants/enums

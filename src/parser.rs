@@ -801,6 +801,8 @@ pub struct FunctionCall {
     pub arg_count: usize,
     /// true if this is a method call (obj.Method())
     pub is_method: bool,
+    /// For method calls, the receiver expression (e.g. "trade" in "trade.Buy()")
+    pub receiver: Option<String>,
 }
 
 /// Extract all function call sites from parsed source code.
@@ -830,9 +832,13 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                         col: start.column as u32,
                         arg_count,
                         is_method: false,
+                        receiver: None,
                     });
                 }
                 "field_expression" => {
+                    // obj.Method() — extract method name and receiver
+                    let receiver = func_node.child(0)
+                        .map(|n| source[n.byte_range()].to_string());
                     if let Some(field) = find_child_by_kind(func_node, "field_identifier") {
                         let name = &source[field.byte_range()];
                         let start = field.start_position();
@@ -842,6 +848,7 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                             col: start.column as u32,
                             arg_count,
                             is_method: true,
+                            receiver,
                         });
                     }
                 }
@@ -855,6 +862,7 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                             col: start.column as u32,
                             arg_count,
                             is_method: false,
+                            receiver: None,
                         });
                     }
                 }
@@ -909,6 +917,122 @@ fn count_arguments(args_node: Node, source: &str) -> usize {
         i += 1;
     }
     count
+}
+
+// ── Argument position extraction (for inlay hints) ──
+
+/// Extract the (line, col) positions of each argument in a function call at the given location.
+pub fn extract_call_arg_positions(
+    source: &str,
+    tree: &Tree,
+    call_line: u32,
+    call_col: u32,
+) -> Vec<(u32, u32)> {
+    let root = tree.root_node();
+    let mut positions = Vec::new();
+    find_call_args(root, source, call_line, call_col, &mut positions);
+    positions
+}
+
+fn find_call_args(
+    node: Node,
+    source: &str,
+    target_line: u32,
+    target_col: u32,
+    out: &mut Vec<(u32, u32)>,
+) {
+    if node.kind() == "call_expression" {
+        // Check if this call is at the right location
+        let func_node = node.child(0);
+        let matches = func_node.map(|f| {
+            let start = f.start_position();
+            start.row as u32 == target_line && start.column as u32 == target_col
+        }).unwrap_or(false);
+
+        // Also check field_identifier for method calls
+        let matches = matches || func_node.and_then(|f| {
+            if f.kind() == "field_expression" {
+                find_child_by_kind(f, "field_identifier")
+            } else {
+                None
+            }
+        }).map(|f| {
+            let start = f.start_position();
+            start.row as u32 == target_line && start.column as u32 == target_col
+        }).unwrap_or(false);
+
+        if matches {
+            if let Some(args) = node.child_by_field_name("arguments")
+                .or_else(|| find_child_by_kind(node, "argument_list"))
+            {
+                // Use source text to find arg start positions (handles color literals)
+                let text = &source[args.byte_range()];
+                let base_byte = args.start_byte();
+
+                // Find positions of each argument start
+                let inner_start = 1; // skip '('
+                let inner_end = text.len().saturating_sub(1); // skip ')'
+                if inner_start < inner_end {
+                    let inner = &text[inner_start..inner_end];
+                    let mut depth = 0i32;
+                    let mut in_color = false;
+                    // First arg starts right after '('
+                    // Find its position, skipping whitespace
+                    let first_non_ws = inner.find(|c: char| !c.is_whitespace())
+                        .unwrap_or(0);
+                    let abs_byte = base_byte + inner_start + first_non_ws;
+                    let (line, col) = byte_to_line_col(source, abs_byte);
+                    out.push((line, col));
+
+                    for (i, b) in inner.bytes().enumerate() {
+                        match b {
+                            b'(' | b'<' | b'[' => depth += 1,
+                            b')' | b'>' | b']' => depth -= 1,
+                            b'\'' if in_color => in_color = false,
+                            b'\'' if i > 0 && inner.as_bytes()[i-1] == b'C' => in_color = true,
+                            b',' if depth == 0 && !in_color => {
+                                // Next arg starts after this comma
+                                let after_comma = &inner[i+1..];
+                                let ws_skip = after_comma.find(|c: char| !c.is_whitespace())
+                                    .unwrap_or(0);
+                                let abs_byte = base_byte + inner_start + i + 1 + ws_skip;
+                                let (line, col) = byte_to_line_col(source, abs_byte);
+                                out.push((line, col));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return; // Found our call, done
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_call_args(child, source, target_line, target_col, out);
+        if !out.is_empty() {
+            return;
+        }
+    }
+}
+
+/// Convert a byte offset in source to (line, col).
+fn byte_to_line_col(source: &str, byte_offset: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut col = 0u32;
+    for (i, ch) in source.char_indices() {
+        if i >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
 }
 
 // ── Error node extraction (for diagnostics) ──
