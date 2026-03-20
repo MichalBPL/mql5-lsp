@@ -815,7 +815,7 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
         // Count arguments from the argument_list child
         let arg_count = node.child_by_field_name("arguments")
             .or_else(|| find_child_by_kind(node, "argument_list"))
-            .map(|args| count_arguments(args))
+            .map(|args| count_arguments(args, source))
             .unwrap_or(0);
 
         // The function name is the first child (usually an identifier or field_expression)
@@ -869,15 +869,44 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
     }
 }
 
-/// Count arguments in an argument_list node (handles nested calls correctly).
-fn count_arguments(args_node: Node) -> usize {
-    let mut count = 0;
-    let mut cursor = args_node.walk();
-    for child in args_node.children(&mut cursor) {
-        // Count non-punctuation children (skip parens and commas)
-        if child.kind() != "(" && child.kind() != ")" && child.kind() != "," {
-            count += 1;
+/// Count arguments in an argument_list node.
+/// Uses source text to handle MQL5 color literals C'r,g,b' correctly
+/// (commas inside color literals are not argument separators).
+fn count_arguments(args_node: Node, source: &str) -> usize {
+    let text = &source[args_node.byte_range()];
+    // Strip outer parens
+    let inner = text.strip_prefix('(').unwrap_or(text);
+    let inner = inner.strip_suffix(')').unwrap_or(inner);
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return 0;
+    }
+
+    let mut count = 1usize; // at least 1 arg if non-empty
+    let mut depth = 0i32;
+    let mut in_color_literal = false;
+    let bytes = inner.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'<' | b'[' => depth += 1,
+            b')' | b'>' | b']' => depth -= 1,
+            b'\'' if in_color_literal => {
+                in_color_literal = false; // closing '
+            }
+            b'\'' => {
+                // Check for C' color literal: look back for 'C'
+                if i > 0 && bytes[i - 1] == b'C' {
+                    in_color_literal = true;
+                }
+            }
+            b',' if depth == 0 && !in_color_literal => {
+                count += 1;
+            }
+            _ => {}
         }
+        i += 1;
     }
     count
 }
@@ -1090,6 +1119,16 @@ void OnTick() {
         assert_eq!(resolve_type_at(source, &tree, "trade", 10), Some("CTrade".to_string()));
         assert_eq!(resolve_type_at(source, &tree, "x", 10), Some("int".to_string()));
         assert_eq!(resolve_type_at(source, &tree, "nonexistent", 10), None);
+    }
+
+    #[test]
+    fn test_color_literal_arg_count() {
+        // ColorToARGB(C'30,140,50', 220) should be 2 args, not 4
+        let source = "void f() { ColorToARGB(C'30,140,50', 220); }";
+        let tree = parse(source).unwrap();
+        let calls = extract_function_calls(source, &tree);
+        let call = calls.iter().find(|c| c.name == "ColorToARGB").unwrap();
+        assert_eq!(call.arg_count, 2, "C'r,g,b' should count as 1 arg, got {}", call.arg_count);
     }
 
     #[test]

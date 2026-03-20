@@ -832,12 +832,7 @@ impl Mql5Lsp {
 
                 // Check if it's a builtin function — verify argument count
                 // Skip method calls since the same name may have different signatures
-                // Skip functions commonly called with color literals C'r,g,b' which
-                // confuse the tree-sitter arg counter (commas inside literal)
-                if let Some(func) = find_function(&call.name)
-                    .filter(|_| !call.is_method)
-                    .filter(|f| !f.signature.contains("color"))
-                {
+                if let Some(func) = find_function(&call.name).filter(|_| !call.is_method) {
                     let expected = count_signature_params(func.signature);
                     // Only check if we have a definite expected count and call has args
                     if expected.min > 0 && call.arg_count < expected.min {
