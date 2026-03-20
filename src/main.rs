@@ -817,21 +817,11 @@ impl Mql5Lsp {
             }
         }
 
-        // (d) Undeclared function calls — check calls against builtins + workspace index
+        // (d) Function call diagnostics: undeclared + wrong argument count
         {
             let calls = parser::extract_function_calls(&source, &tree);
             let index = self.index.read().await;
             for call in &calls {
-                // Skip if it's a builtin
-                if find_function(&call.name).is_some() { continue; }
-                // Skip if it's a known keyword/type/constant
-                if find_enum(&call.name).is_some()
-                    || find_struct(&call.name).is_some()
-                    || find_constant(&call.name).is_some()
-                    || is_builtin_type(&call.name)
-                {
-                    continue;
-                }
                 // Skip C/C++ keywords that look like calls
                 if matches!(call.name.as_str(),
                     "if" | "for" | "while" | "switch" | "return" | "else" | "do"
@@ -839,7 +829,52 @@ impl Mql5Lsp {
                 ) {
                     continue;
                 }
-                // Skip if found in workspace index (definitions)
+
+                // Check if it's a builtin function — verify argument count
+                if let Some(func) = find_function(&call.name) {
+                    let expected = count_signature_params(func.signature);
+                    // Only check if we have a definite expected count and call has args
+                    if expected.min > 0 && call.arg_count < expected.min {
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position { line: call.line, character: call.col },
+                                end: Position { line: call.line, character: call.col + call.name.len() as u32 },
+                            },
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("mql5-lsp".to_string()),
+                            message: format!(
+                                "`{}` expects at least {} argument(s), got {}",
+                                call.name, expected.min, call.arg_count
+                            ),
+                            ..Default::default()
+                        });
+                    } else if expected.max > 0 && call.arg_count > expected.max {
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position { line: call.line, character: call.col },
+                                end: Position { line: call.line, character: call.col + call.name.len() as u32 },
+                            },
+                            severity: Some(DiagnosticSeverity::WARNING),
+                            source: Some("mql5-lsp".to_string()),
+                            message: format!(
+                                "`{}` expects at most {} argument(s), got {}",
+                                call.name, expected.max, call.arg_count
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                    continue;
+                }
+
+                // Skip known types/constants/enums
+                if find_enum(&call.name).is_some()
+                    || find_struct(&call.name).is_some()
+                    || find_constant(&call.name).is_some()
+                    || is_builtin_type(&call.name)
+                {
+                    continue;
+                }
+                // Skip if found in workspace index
                 if !index.find_symbols(&call.name).is_empty() {
                     continue;
                 }
@@ -850,14 +885,8 @@ impl Mql5Lsp {
 
                 diagnostics.push(Diagnostic {
                     range: Range {
-                        start: Position {
-                            line: call.line,
-                            character: call.col,
-                        },
-                        end: Position {
-                            line: call.line,
-                            character: call.col + call.name.len() as u32,
-                        },
+                        start: Position { line: call.line, character: call.col },
+                        end: Position { line: call.line, character: call.col + call.name.len() as u32 },
                     },
                     severity: Some(DiagnosticSeverity::HINT),
                     source: Some("mql5-lsp".to_string()),
@@ -1037,72 +1066,23 @@ impl Mql5Lsp {
     }
 
     /// Try to resolve the type of a variable by looking at declarations.
+    /// Uses AST-based resolution first, then falls back to workspace index.
     async fn resolve_variable_type(
         &self,
         var_name: &str,
         _uri: &Url,
         source: &str,
     ) -> Option<String> {
-        // Simple heuristic: search for "Type var_name" pattern in source
-        for line in source.lines() {
-            let trimmed = line.trim();
-
-            // Match patterns like: ClassName var_name; or ClassName* var_name;
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                let potential_var = parts[1]
-                    .trim_start_matches('*')
-                    .trim_start_matches('&')
-                    .trim_end_matches(';')
-                    .trim_end_matches(',')
-                    .trim_end_matches('=');
-                if potential_var == var_name {
-                    let type_name = parts[0].trim_end_matches('*').trim_end_matches('&');
-                    // Verify it looks like a type
-                    if type_name.chars().next().is_some_and(|c| c.is_uppercase())
-                        || is_builtin_type(type_name)
-                    {
-                        return Some(type_name.to_string());
-                    }
-                }
-            }
-
-            // Match `var = new ClassName(...)` pattern
-            if let Some(after_eq) = trimmed.strip_prefix(&format!("{} =", var_name))
-                .or_else(|| trimmed.strip_prefix(&format!("{} =", var_name)))
-            {
-                let rhs = after_eq.trim().trim_start_matches('=').trim();
-                if let Some(rest) = rhs.strip_prefix("new ") {
-                    let class_name = rest.split(|c: char| !c.is_alphanumeric() && c != '_')
-                        .next()
-                        .unwrap_or("");
-                    if !class_name.is_empty() {
-                        return Some(class_name.to_string());
-                    }
-                }
-            }
-
-            // Match `var = SomeFunction(...)` — look up function return type
-            if parts.len() >= 4 && parts[1] == var_name && parts[2] == "=" {
-                let rhs = parts[3..].join(" ");
-                if let Some(paren_pos) = rhs.find('(') {
-                    let func_name = &rhs[..paren_pos];
-                    if !func_name.is_empty() && func_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                        // Look up the function's return type from builtins
-                        if let Some(func) = find_function(func_name) {
-                            let ret_type = func.signature.split_whitespace().next();
-                            if let Some(t) = ret_type {
-                                if t != "void" {
-                                    return Some(t.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
+        // AST-based: parse the source and walk declarations
+        if let Some(tree) = parser::parse(source) {
+            // Use line count as "use_line" to search the whole file
+            let use_line = source.lines().count();
+            if let Some(t) = parser::resolve_type_at(source, &tree, var_name, use_line) {
+                return Some(t);
             }
         }
 
-        // Also check workspace symbols for the variable's type
+        // Fallback: check workspace symbols for the variable's type
         let index = self.index.read().await;
         if let Some(sym) = index.find_symbol(var_name) {
             // Parse type from detail string
@@ -1134,6 +1114,62 @@ fn make_hover(value: String) -> Hover {
 
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Expected argument count range for a function.
+struct ExpectedArgs {
+    min: usize,
+    max: usize, // 0 = unlimited (variadic)
+}
+
+/// Count expected parameters from a signature like "void Foo(int a, string b = \"x\")".
+/// Parameters with `= default` are optional, reducing min count.
+fn count_signature_params(signature: &str) -> ExpectedArgs {
+    let start = match signature.find('(') {
+        Some(p) => p + 1,
+        None => return ExpectedArgs { min: 0, max: 0 },
+    };
+    let end = match signature.rfind(')') {
+        Some(p) => p,
+        None => return ExpectedArgs { min: 0, max: 0 },
+    };
+    if start >= end {
+        return ExpectedArgs { min: 0, max: 0 };
+    }
+
+    let params_str = &signature[start..end].trim();
+    if params_str.is_empty() {
+        return ExpectedArgs { min: 0, max: 0 };
+    }
+
+    // Split by commas (respecting nested parens)
+    let mut total = 0usize;
+    let mut optional = 0usize;
+    let mut depth = 0i32;
+    let mut current = String::new();
+
+    for ch in params_str.chars() {
+        match ch {
+            '(' | '<' | '[' => { depth += 1; current.push(ch); }
+            ')' | '>' | ']' => { depth -= 1; current.push(ch); }
+            ',' if depth == 0 => {
+                if current.contains('=') { optional += 1; }
+                total += 1;
+                current.clear();
+            }
+            _ => { current.push(ch); }
+        }
+    }
+    // Last parameter
+    if !current.trim().is_empty() {
+        if current.contains('=') { optional += 1; }
+        total += 1;
+    }
+
+    ExpectedArgs {
+        min: total.saturating_sub(optional),
+        max: total,
+    }
 }
 
 /// Scan backwards from (line, col) to find the enclosing function call name

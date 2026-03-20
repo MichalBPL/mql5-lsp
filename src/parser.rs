@@ -598,6 +598,192 @@ fn collect_identifiers(node: Node, source: &str, out: &mut Vec<(String, u32, u32
     }
 }
 
+// ── Variable type resolution from AST ──
+
+/// Resolve the type of a variable at a given line by searching the AST for declarations.
+/// Returns the type name if found.
+pub fn resolve_type_at(source: &str, tree: &Tree, var_name: &str, use_line: usize) -> Option<String> {
+    let root = tree.root_node();
+    let mut best: Option<(usize, String)> = None; // (line, type_name) — closest declaration above use site
+
+    resolve_type_recursive(root, source, var_name, use_line, &mut best);
+    best.map(|(_, t)| t)
+}
+
+fn resolve_type_recursive(
+    node: Node,
+    source: &str,
+    var_name: &str,
+    use_line: usize,
+    best: &mut Option<(usize, String)>,
+) {
+    match node.kind() {
+        "declaration" | "field_declaration" => {
+            // Look for: Type varName ...
+            let decl_line = node.start_position().row;
+            if decl_line <= use_line {
+                try_extract_var_type(node, source, var_name, decl_line, best);
+            }
+        }
+        "parameter_declaration" => {
+            // Function parameters: void Foo(Type varName)
+            let decl_line = node.start_position().row;
+            if decl_line <= use_line {
+                try_extract_param_type(node, source, var_name, decl_line, best);
+            }
+        }
+        "init_declarator" => {
+            // Type var = new ClassName(...)
+            let decl_line = node.start_position().row;
+            if decl_line <= use_line {
+                try_extract_init_type(node, source, var_name, decl_line, best);
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        resolve_type_recursive(child, source, var_name, use_line, best);
+    }
+}
+
+fn try_extract_var_type(
+    node: Node,
+    source: &str,
+    var_name: &str,
+    decl_line: usize,
+    best: &mut Option<(usize, String)>,
+) {
+    // Find the type specifier (first child that's a type)
+    let mut type_name = None;
+    let mut found_var = false;
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "primitive_type" | "type_identifier" | "sized_type_specifier"
+            | "template_type" | "qualified_identifier" => {
+                type_name = Some(node_text(child, source).to_string());
+            }
+            "identifier" | "field_identifier" => {
+                let name = node_text(child, source);
+                if name == var_name {
+                    found_var = true;
+                }
+            }
+            "init_declarator" => {
+                // Check inside init_declarator for the variable name
+                if let Some(id) = find_child_by_kind(child, "identifier") {
+                    if node_text(id, source) == var_name {
+                        found_var = true;
+                        // Check for `= new ClassName(...)`
+                        if let Some(new_expr) = find_descendant_by_kind(child, "new_expression") {
+                            if let Some(type_id) = find_child_by_kind(new_expr, "type_identifier") {
+                                type_name = Some(node_text(type_id, source).to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            "pointer_declarator" => {
+                if let Some(id) = find_descendant_by_kind(child, "identifier") {
+                    if node_text(id, source) == var_name {
+                        found_var = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if found_var {
+        if let Some(t) = type_name {
+            let t = t.trim_end_matches('*').trim_end_matches('&').to_string();
+            match best {
+                Some((prev_line, _)) if decl_line > *prev_line => {
+                    *best = Some((decl_line, t));
+                }
+                None => {
+                    *best = Some((decl_line, t));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn try_extract_param_type(
+    node: Node,
+    source: &str,
+    var_name: &str,
+    decl_line: usize,
+    best: &mut Option<(usize, String)>,
+) {
+    let mut type_name = None;
+    let mut found_var = false;
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "primitive_type" | "type_identifier" | "sized_type_specifier"
+            | "template_type" | "qualified_identifier" => {
+                type_name = Some(node_text(child, source).to_string());
+            }
+            "identifier" => {
+                if node_text(child, source) == var_name {
+                    found_var = true;
+                }
+            }
+            "pointer_declarator" | "reference_declarator" => {
+                if let Some(id) = find_descendant_by_kind(child, "identifier") {
+                    if node_text(id, source) == var_name {
+                        found_var = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if found_var {
+        if let Some(t) = type_name {
+            let t = t.trim_end_matches('*').trim_end_matches('&').to_string();
+            if best.is_none() {
+                *best = Some((decl_line, t));
+            }
+        }
+    }
+}
+
+fn try_extract_init_type(
+    node: Node,
+    source: &str,
+    var_name: &str,
+    decl_line: usize,
+    best: &mut Option<(usize, String)>,
+) {
+    if let Some(id) = find_child_by_kind(node, "identifier") {
+        if node_text(id, source) == var_name {
+            // Check for `= new ClassName(...)`
+            if let Some(new_expr) = find_descendant_by_kind(node, "new_expression") {
+                if let Some(type_id) = find_child_by_kind(new_expr, "type_identifier") {
+                    let t = node_text(type_id, source).to_string();
+                    match best {
+                        Some((prev_line, _)) if decl_line > *prev_line => {
+                            *best = Some((decl_line, t));
+                        }
+                        None => {
+                            *best = Some((decl_line, t));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Function call extraction (for diagnostics) ──
 
 /// A function call site found in source code.
@@ -606,6 +792,7 @@ pub struct FunctionCall {
     pub name: String,
     pub line: u32,
     pub col: u32,
+    pub arg_count: usize,
 }
 
 /// Extract all function call sites from parsed source code.
@@ -617,6 +804,12 @@ pub fn extract_function_calls(source: &str, tree: &Tree) -> Vec<FunctionCall> {
 
 fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>) {
     if node.kind() == "call_expression" {
+        // Count arguments from the argument_list child
+        let arg_count = node.child_by_field_name("arguments")
+            .or_else(|| find_child_by_kind(node, "argument_list"))
+            .map(|args| count_arguments(args))
+            .unwrap_or(0);
+
         // The function name is the first child (usually an identifier or field_expression)
         if let Some(func_node) = node.child(0) {
             match func_node.kind() {
@@ -627,10 +820,10 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                         name: name.to_string(),
                         line: start.row as u32,
                         col: start.column as u32,
+                        arg_count,
                     });
                 }
                 "field_expression" => {
-                    // obj.Method() — extract the method name
                     if let Some(field) = find_child_by_kind(func_node, "field_identifier") {
                         let name = &source[field.byte_range()];
                         let start = field.start_position();
@@ -638,11 +831,11 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                             name: name.to_string(),
                             line: start.row as u32,
                             col: start.column as u32,
+                            arg_count,
                         });
                     }
                 }
                 "qualified_identifier" => {
-                    // Scope::Function() — extract the function name part
                     let text = &source[func_node.byte_range()];
                     if let Some(last_part) = text.rsplit("::").next() {
                         let start = func_node.start_position();
@@ -650,6 +843,7 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                             name: last_part.to_string(),
                             line: start.row as u32,
                             col: start.column as u32,
+                            arg_count,
                         });
                     }
                 }
@@ -662,6 +856,19 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
     for child in node.children(&mut cursor) {
         collect_function_calls(child, source, out);
     }
+}
+
+/// Count arguments in an argument_list node (handles nested calls correctly).
+fn count_arguments(args_node: Node) -> usize {
+    let mut count = 0;
+    let mut cursor = args_node.walk();
+    for child in args_node.children(&mut cursor) {
+        // Count non-punctuation children (skip parens and commas)
+        if child.kind() != "(" && child.kind() != ")" && child.kind() != "," {
+            count += 1;
+        }
+    }
+    count
 }
 
 // ── Error node extraction (for diagnostics) ──
@@ -856,6 +1063,22 @@ void Foo() { Print(x); }
         assert!(idents.iter().any(|(name, _, _, _)| name == "x"));
         assert!(idents.iter().any(|(name, _, _, _)| name == "Foo"));
         assert!(idents.iter().any(|(name, _, _, _)| name == "Print"));
+    }
+
+    #[test]
+    fn test_resolve_type_at() {
+        let source = r#"
+void OnTick() {
+    MqlTick tick;
+    CTrade *trade;
+    int x = 42;
+}
+"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(resolve_type_at(source, &tree, "tick", 10), Some("MqlTick".to_string()));
+        assert_eq!(resolve_type_at(source, &tree, "trade", 10), Some("CTrade".to_string()));
+        assert_eq!(resolve_type_at(source, &tree, "x", 10), Some("int".to_string()));
+        assert_eq!(resolve_type_at(source, &tree, "nonexistent", 10), None);
     }
 
     #[test]
