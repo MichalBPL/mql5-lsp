@@ -103,6 +103,7 @@ impl LanguageServer for Mql5Lsp {
                 }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                color_provider: Some(ColorProviderCapability::Simple(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -723,6 +724,93 @@ impl LanguageServer for Mql5Lsp {
         }
     }
 
+    // ── Document Colors ──
+
+    async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
+        let uri = &params.text_document.uri;
+        let source = match self.get_source(uri) {
+            Some(s) => s,
+            None => return Ok(vec![]),
+        };
+
+        let mut colors = Vec::new();
+
+        // Find all C'r,g,b' color literals in the source
+        // MQL5 color literals are RGB
+        let bytes = source.as_bytes();
+        let mut i = 0;
+        while i < bytes.len().saturating_sub(6) {
+            if bytes[i] == b'C' && bytes.get(i + 1) == Some(&b'\'') {
+                // Try to parse C'r,g,b'
+                if let Some((r, g, b, end)) = parse_color_literal_at(bytes, i + 2) {
+                    let (start_line, start_col) = byte_to_position(&source, i);
+                    let (end_line, end_col) = byte_to_position(&source, end);
+
+                    colors.push(ColorInformation {
+                        range: Range {
+                            start: Position { line: start_line, character: start_col },
+                            end: Position { line: end_line, character: end_col },
+                        },
+                        color: Color {
+                            red: r as f32 / 255.0,
+                            green: g as f32 / 255.0,
+                            blue: b as f32 / 255.0,
+                            alpha: 1.0,
+                        },
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+
+            // Also detect MQL5 named color constants (clrRed, clrBlue, etc.)
+            if bytes[i..].starts_with(b"clr") {
+                if let Some((r, g, b, name_end)) = parse_named_color(&source, i) {
+                    let (start_line, start_col) = byte_to_position(&source, i);
+                    let (end_line, end_col) = byte_to_position(&source, name_end);
+
+                    colors.push(ColorInformation {
+                        range: Range {
+                            start: Position { line: start_line, character: start_col },
+                            end: Position { line: end_line, character: end_col },
+                        },
+                        color: Color {
+                            red: r as f32 / 255.0,
+                            green: g as f32 / 255.0,
+                            blue: b as f32 / 255.0,
+                            alpha: 1.0,
+                        },
+                    });
+                    i = name_end;
+                    continue;
+                }
+            }
+
+            i += 1;
+        }
+
+        Ok(colors)
+    }
+
+    async fn color_presentation(
+        &self,
+        params: ColorPresentationParams,
+    ) -> Result<Vec<ColorPresentation>> {
+        let color = params.color;
+        let r = (color.red * 255.0).round() as u8;
+        let g = (color.green * 255.0).round() as u8;
+        let b = (color.blue * 255.0).round() as u8;
+
+        Ok(vec![ColorPresentation {
+            label: format!("C'{},{},{}'", r, g, b),
+            text_edit: Some(TextEdit {
+                range: params.range,
+                new_text: format!("C'{},{},{}'", r, g, b),
+            }),
+            additional_text_edits: None,
+        }])
+    }
+
     // ── Document Symbols ──
 
     async fn document_symbol(
@@ -1277,6 +1365,55 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Convert a byte offset to (line, character) position.
+fn byte_to_position(source: &str, byte_offset: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut col = 0u32;
+    for (i, ch) in source.char_indices() {
+        if i >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// Parse r,g,b values from bytes starting after C'
+/// Returns (r, g, b, end_byte_offset_after_closing_quote)
+fn parse_color_literal_at(bytes: &[u8], start: usize) -> Option<(u8, u8, u8, usize)> {
+    let mut i = start;
+    let mut values = [0u16; 3];
+    let mut val_idx = 0;
+    let mut has_digit = false;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'0'..=b'9' => {
+                values[val_idx] = values[val_idx] * 10 + (bytes[i] - b'0') as u16;
+                if values[val_idx] > 255 { return None; }
+                has_digit = true;
+            }
+            b',' => {
+                if !has_digit || val_idx >= 2 { return None; }
+                val_idx += 1;
+                has_digit = false;
+            }
+            b'\'' => {
+                if !has_digit || val_idx != 2 { return None; }
+                return Some((values[0] as u8, values[1] as u8, values[2] as u8, i + 1));
+            }
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Expected argument count range for a function.
 struct ExpectedArgs {
     min: usize,
@@ -1337,6 +1474,55 @@ fn count_signature_params(signature: &str) -> ExpectedArgs {
         min: total.saturating_sub(optional),
         max: total,
     }
+}
+
+/// Parse a named MQL5 color constant like clrRed, clrBlue.
+/// Returns (r, g, b, end_byte_offset)
+fn parse_named_color(source: &str, start: usize) -> Option<(u8, u8, u8, usize)> {
+    let rest = &source[start..];
+    // Extract the identifier
+    let end = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(rest.len());
+    let name = &rest[..end];
+
+    let (r, g, b) = match name {
+        "clrRed" => (255, 0, 0),
+        "clrGreen" => (0, 128, 0),
+        "clrBlue" => (0, 0, 255),
+        "clrWhite" => (255, 255, 255),
+        "clrBlack" => (0, 0, 0),
+        "clrYellow" => (255, 255, 0),
+        "clrMagenta" => (255, 0, 255),
+        "clrCyan" => (0, 255, 255),
+        "clrOrange" => (255, 165, 0),
+        "clrPink" => (255, 192, 203),
+        "clrGray" | "clrGrey" => (128, 128, 128),
+        "clrSilver" => (192, 192, 192),
+        "clrGold" => (255, 215, 0),
+        "clrLime" => (0, 255, 0),
+        "clrAqua" => (0, 255, 255),
+        "clrMaroon" => (128, 0, 0),
+        "clrNavy" => (0, 0, 128),
+        "clrOlive" => (128, 128, 0),
+        "clrPurple" => (128, 0, 128),
+        "clrTeal" => (0, 128, 128),
+        "clrDarkGreen" => (0, 100, 0),
+        "clrDarkBlue" => (0, 0, 139),
+        "clrDarkRed" => (139, 0, 0),
+        "clrDarkGray" | "clrDarkGrey" => (169, 169, 169),
+        "clrLightGray" | "clrLightGrey" => (211, 211, 211),
+        "clrDodgerBlue" => (30, 144, 255),
+        "clrCornflowerBlue" => (100, 149, 237),
+        "clrRoyalBlue" => (65, 105, 225),
+        "clrTomato" => (255, 99, 71),
+        "clrCoral" => (255, 127, 80),
+        "clrSalmon" => (250, 128, 114),
+        "clrChocolate" => (210, 105, 30),
+        "clrSienna" => (160, 82, 45),
+        "clrKhaki" => (240, 230, 140),
+        "clrNONE" => return None, // transparent — no color to show
+        _ => return None,
+    };
+    Some((r, g, b, start + end))
 }
 
 /// Scan backwards from (line, col) to find the enclosing function call name
