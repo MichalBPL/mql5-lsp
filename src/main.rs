@@ -1120,8 +1120,26 @@ impl Mql5Lsp {
 
         // (a) Syntax errors from tree-sitter ERROR/MISSING nodes
         {
+            let source_lines: Vec<&str> = source.lines().collect();
             let errors = parser::extract_errors(&source, &tree);
             for err in errors {
+                // Suppress known MQL5 constructs that C++ grammar can't parse
+                let line_text = source_lines.get(err.start_line as usize).unwrap_or(&"");
+                let trimmed = line_text.trim();
+
+                // input group "..." — MQL5 parameter grouping
+                if trimmed.starts_with("input group") { continue; }
+                // sinput group "..."
+                if trimmed.starts_with("sinput group") { continue; }
+                // #property — MQL5 preprocessor directive
+                if trimmed.starts_with("#property") { continue; }
+                // #import "..." — MQL5 DLL import
+                if trimmed.starts_with("#import") { continue; }
+                // #resource "..." — embedded resource
+                if trimmed.starts_with("#resource") { continue; }
+                // operator overloads with MQL5 syntax that C++ doesn't like
+                if trimmed.contains("operator") && err.message.contains("Syntax error") { continue; }
+
                 diagnostics.push(Diagnostic {
                     range: Range {
                         start: Position { line: err.start_line, character: err.start_col },
