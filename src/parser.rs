@@ -511,8 +511,39 @@ pub fn get_completion_context(source: &str, line: usize, col: usize) -> Completi
     // Check for dot access: `expr.`
     if trimmed.ends_with('.') {
         let before_dot = trimmed[..trimmed.len() - 1].trim_end();
-        // Extract the identifier before the dot
-        let object = extract_last_identifier(before_dot);
+
+        // Handle array indexing: `arr[i].` or `arr[expr].` — extract `arr`
+        let object_source = if before_dot.ends_with(']') {
+            // Walk backwards to find matching '['
+            let bytes = before_dot.as_bytes();
+            let mut depth = 0i32;
+            let mut bracket_start = None;
+            let mut i = bytes.len();
+            while i > 0 {
+                i -= 1;
+                match bytes[i] {
+                    b']' => depth += 1,
+                    b'[' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            bracket_start = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match bracket_start {
+                Some(pos) => &before_dot[..pos],
+                None => before_dot,
+            }
+        } else {
+            before_dot
+        };
+
+        // Handle chained dot access: `a.b.` — extract `b` but resolve through `a`
+        // For now extract the last identifier (handles simple `obj.` and `arr[i].`)
+        let object = extract_last_identifier(object_source);
         if !object.is_empty() {
             return CompletionContext::DotAccess {
                 object_text: object.to_string(),
@@ -747,6 +778,22 @@ fn try_extract_var_type(
                         }
                     }
                 }
+                // Also check for array init: Type arr[] = ...
+                if let Some(arr_decl) = find_descendant_by_kind(child, "array_declarator") {
+                    if let Some(id) = find_child_by_kind(arr_decl, "identifier") {
+                        if node_text(id, source) == var_name {
+                            found_var = true;
+                        }
+                    }
+                }
+            }
+            "array_declarator" => {
+                // Type arr[] — the identifier is inside the array_declarator
+                if let Some(id) = find_child_by_kind(child, "identifier") {
+                    if node_text(id, source) == var_name {
+                        found_var = true;
+                    }
+                }
             }
             "pointer_declarator" => {
                 if let Some(id) = find_descendant_by_kind(child, "identifier") {
@@ -801,6 +848,22 @@ fn try_extract_param_type(
                 if let Some(id) = find_descendant_by_kind(child, "identifier") {
                     if node_text(id, source) == var_name {
                         found_var = true;
+                    }
+                }
+            }
+            "array_declarator" => {
+                // Type arr[] parameter
+                if let Some(id) = find_child_by_kind(child, "identifier") {
+                    if node_text(id, source) == var_name {
+                        found_var = true;
+                    }
+                }
+                // Also check reference_declarator inside: Type& arr[]
+                if let Some(ref_decl) = find_child_by_kind(child, "reference_declarator") {
+                    if let Some(id) = find_descendant_by_kind(ref_decl, "identifier") {
+                        if node_text(id, source) == var_name {
+                            found_var = true;
+                        }
                     }
                 }
             }
@@ -1299,6 +1362,33 @@ void OnTick() {
         assert_eq!(resolve_type_at(source, &tree, "trade", 10), Some("CTrade".to_string()));
         assert_eq!(resolve_type_at(source, &tree, "x", 10), Some("int".to_string()));
         assert_eq!(resolve_type_at(source, &tree, "nonexistent", 10), None);
+    }
+
+    #[test]
+    fn test_resolve_array_element_type() {
+        let source = r#"
+void OnTick() {
+    MqlRates rates[];
+    CMyClass *objects[];
+}
+"#;
+        let tree = parse(source).unwrap();
+        assert_eq!(resolve_type_at(source, &tree, "rates", 10), Some("MqlRates".to_string()));
+        assert_eq!(resolve_type_at(source, &tree, "objects", 10), Some("CMyClass".to_string()));
+    }
+
+    #[test]
+    fn test_completion_context_array_dot() {
+        // arr[i]. should extract "arr" as the object
+        assert_eq!(
+            get_completion_context("    rates[i].", 0, 13),
+            CompletionContext::DotAccess { object_text: "rates".to_string() }
+        );
+        // Nested: arr[foo(x)]. should extract "arr" — cursor at col 21 (after dot)
+        assert_eq!(
+            get_completion_context("    data[GetIndex()].", 0, 21),
+            CompletionContext::DotAccess { object_text: "data".to_string() }
+        );
     }
 
     #[test]
