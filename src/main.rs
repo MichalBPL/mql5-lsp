@@ -739,31 +739,11 @@ impl Mql5Lsp {
         // for err in errors { ... }
 
         // (c) Unresolved includes
-        let includes = parser::extract_includes(&source, &tree);
-        if let Ok(path) = uri.to_file_path() {
-            let mut resolver = self.include_resolver.write().await;
-            for inc in &includes {
-                if resolver.resolve(inc, &path).is_none() {
-                    let line = inc.line;
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line,
-                                character: 0,
-                            },
-                            end: Position {
-                                line,
-                                character: 1000,
-                            },
-                        },
-                        severity: Some(DiagnosticSeverity::ERROR),
-                        source: Some("mql5-lsp".to_string()),
-                        message: format!("Unresolved include: {}", inc.path),
-                        ..Default::default()
-                    });
-                }
-            }
-        }
+        // DISABLED: the include resolver has edge cases with relative paths
+        // in subdirectories and the second LSP instance for MQL5/Include/.
+        // Re-enable when include resolution is more robust.
+        // let includes = parser::extract_includes(&source, &tree);
+        // if let Ok(path) = uri.to_file_path() { ... }
 
         // (d) Duplicate definitions within the same file
         {
