@@ -448,6 +448,11 @@ fn parse_include_directive(node: Node, source: &str) -> Option<IncludeDirective>
     parse_include_line(text, node.start_position().row as u32)
 }
 
+/// Public wrapper for use from go-to-definition.
+pub fn parse_include_from_line(line: &str, line_num: u32) -> Option<IncludeDirective> {
+    parse_include_line(line, line_num)
+}
+
 fn parse_include_line(line: &str, line_num: u32) -> Option<IncludeDirective> {
     let after_include = line.strip_prefix("#include")?.trim();
 
@@ -571,28 +576,79 @@ fn is_ident_char(b: u8) -> bool {
 
 // ── Identifier extraction (for references) ──
 
-/// Extract all identifier usages from a parsed tree.
-/// Returns (name, line, start_col, end_col) tuples.
-pub fn extract_identifiers(source: &str, tree: &Tree) -> Vec<(String, u32, u32, u32)> {
+/// An identifier usage with its scope context.
+#[derive(Clone, Debug)]
+pub struct IdentifierUsage {
+    pub name: String,
+    pub line: u32,
+    pub start_col: u32,
+    pub end_col: u32,
+    /// The enclosing scope: "global", "ClassName", "ClassName::MethodName", or "FunctionName"
+    pub scope: String,
+}
+
+/// Extract all identifier usages from a parsed tree with scope tracking.
+pub fn extract_identifiers_scoped(source: &str, tree: &Tree) -> Vec<IdentifierUsage> {
     let mut identifiers = Vec::new();
-    collect_identifiers(tree.root_node(), source, &mut identifiers);
+    collect_identifiers_scoped(tree.root_node(), source, &mut identifiers, "global");
     identifiers
 }
 
-fn collect_identifiers(node: Node, source: &str, out: &mut Vec<(String, u32, u32, u32)>) {
+/// Legacy non-scoped version for backward compatibility.
+#[allow(dead_code)]
+pub fn extract_identifiers(source: &str, tree: &Tree) -> Vec<(String, u32, u32, u32)> {
+    extract_identifiers_scoped(source, tree)
+        .into_iter()
+        .map(|id| (id.name, id.line, id.start_col, id.end_col))
+        .collect()
+}
+
+fn collect_identifiers_scoped(
+    node: Node,
+    source: &str,
+    out: &mut Vec<IdentifierUsage>,
+    current_scope: &str,
+) {
+    // Determine new scope for children
+    let child_scope;
+    match node.kind() {
+        "function_definition" => {
+            // Extract function name for scope
+            let func_name = find_child_by_kind(node, "function_declarator")
+                .and_then(|d| find_child_by_kind(d, "identifier")
+                    .or_else(|| find_child_by_kind(d, "field_identifier")))
+                .map(|n| node_text(n, source))
+                .unwrap_or("?");
+            if current_scope == "global" {
+                child_scope = func_name.to_string();
+            } else {
+                child_scope = format!("{}::{}", current_scope, func_name);
+            }
+        }
+        "class_specifier" | "struct_specifier" => {
+            let type_name = find_child_by_kind(node, "type_identifier")
+                .map(|n| node_text(n, source))
+                .unwrap_or("?");
+            child_scope = type_name.to_string();
+        }
+        _ => {
+            child_scope = current_scope.to_string();
+        }
+    }
+
     match node.kind() {
         "identifier" | "field_identifier" | "type_identifier" => {
             let text = &source[node.byte_range()];
-            // Skip empty or whitespace-only nodes
             if !text.is_empty() && text.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
                 let start = node.start_position();
                 let end = node.end_position();
-                out.push((
-                    text.to_string(),
-                    start.row as u32,
-                    start.column as u32,
-                    end.column as u32,
-                ));
+                out.push(IdentifierUsage {
+                    name: text.to_string(),
+                    line: start.row as u32,
+                    start_col: start.column as u32,
+                    end_col: end.column as u32,
+                    scope: current_scope.to_string(),
+                });
             }
         }
         _ => {}
@@ -600,7 +656,7 @@ fn collect_identifiers(node: Node, source: &str, out: &mut Vec<(String, u32, u32
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_identifiers(child, source, out);
+        collect_identifiers_scoped(child, source, out, &child_scope);
     }
 }
 

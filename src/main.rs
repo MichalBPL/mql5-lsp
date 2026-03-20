@@ -104,6 +104,34 @@ impl LanguageServer for Mql5Lsp {
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 color_provider: Some(ColorProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        legend: SemanticTokensLegend {
+                            token_types: vec![
+                                SemanticTokenType::VARIABLE,      // 0: local variable
+                                SemanticTokenType::PARAMETER,     // 1: function parameter
+                                SemanticTokenType::FUNCTION,      // 2: function
+                                SemanticTokenType::METHOD,        // 3: method
+                                SemanticTokenType::PROPERTY,      // 4: class field
+                                SemanticTokenType::CLASS,         // 5: class/struct
+                                SemanticTokenType::ENUM,          // 6: enum
+                                SemanticTokenType::ENUM_MEMBER,   // 7: enum value
+                                SemanticTokenType::MACRO,         // 8: #define
+                                SemanticTokenType::TYPE,          // 9: type alias
+                            ],
+                            token_modifiers: vec![
+                                SemanticTokenModifier::DECLARATION,    // 0
+                                SemanticTokenModifier::DEFINITION,     // 1
+                                SemanticTokenModifier::READONLY,       // 2
+                                SemanticTokenModifier::STATIC,         // 3
+                                SemanticTokenModifier::DEFAULT_LIBRARY,// 4: builtin
+                            ],
+                        },
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        range: None,
+                        ..Default::default()
+                    }),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -320,10 +348,35 @@ impl LanguageServer for Mql5Lsp {
         let line = pos.line as usize;
         let col = pos.character as usize;
 
-        let source = self.get_source(uri);
-        let word = source.and_then(|s| parser::extract_word_at(&s, line, col));
+        let source = match self.get_source(uri) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
 
-        let word = match word {
+        // Check if cursor is on an #include line — navigate to included file
+        if let Some(target_line) = source.lines().nth(line) {
+            let trimmed = target_line.trim();
+            if trimmed.starts_with("#include") {
+                if let Some(inc) = parser::parse_include_from_line(trimmed, line as u32) {
+                    if let Ok(path) = uri.to_file_path() {
+                        let mut resolver = self.include_resolver.write().await;
+                        if let Some(resolved) = resolver.resolve(&inc, &path) {
+                            if let Ok(target_uri) = Url::from_file_path(&resolved) {
+                                return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                                    uri: target_uri,
+                                    range: Range {
+                                        start: Position { line: 0, character: 0 },
+                                        end: Position { line: 0, character: 0 },
+                                    },
+                                })));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let word = match parser::extract_word_at(&source, line, col) {
             Some(w) => w,
             None => return Ok(None),
         };
@@ -374,6 +427,14 @@ impl LanguageServer for Mql5Lsp {
         let index = self.index.read().await;
         let mut locations: Vec<Location> = Vec::new();
 
+        // Determine the scope of the identifier at cursor
+        let scope = index.get_scope_at(uri, pos.line, pos.character)
+            .unwrap_or_else(|| "global".to_string());
+
+        // If the symbol has a definition at file scope, use global references
+        // If it's a local variable (scope != "global"), use scoped references
+        let is_global = scope == "global" || !index.find_symbols(&word).is_empty();
+
         // Include definitions if requested
         if params.context.include_declaration {
             for sym in index.find_symbols(&word) {
@@ -384,13 +445,17 @@ impl LanguageServer for Mql5Lsp {
             }
         }
 
-        // Include all references (usages)
-        for reference in index.find_references(&word) {
+        // Include references — scope-aware for locals
+        let refs = if is_global {
+            index.find_references(&word)
+        } else {
+            index.find_references_in_scope(&word, &scope)
+        };
+        for reference in refs {
             let loc = Location {
                 uri: reference.uri.clone(),
                 range: reference.range,
             };
-            // Avoid duplicates with definitions
             if !locations.iter().any(|l| l.uri == loc.uri && l.range == loc.range) {
                 locations.push(loc);
             }
@@ -491,7 +556,11 @@ impl LanguageServer for Mql5Lsp {
 
         let index = self.index.read().await;
 
-        // Collect all locations to rename: definitions + references
+        // Determine scope for rename — locals stay in scope, globals rename everywhere
+        let scope = index.get_scope_at(uri, pos.line, pos.character)
+            .unwrap_or_else(|| "global".to_string());
+        let is_global = scope == "global" || !index.find_symbols(&word).is_empty();
+
         let mut file_edits: HashMap<Url, Vec<TextEdit>> = HashMap::new();
 
         // Definitions
@@ -505,8 +574,13 @@ impl LanguageServer for Mql5Lsp {
                 });
         }
 
-        // References
-        for reference in index.find_references(&word) {
+        // References — scope-aware
+        let refs = if is_global {
+            index.find_references(&word)
+        } else {
+            index.find_references_in_scope(&word, &scope)
+        };
+        for reference in refs {
             file_edits
                 .entry(reference.uri.clone())
                 .or_default()
@@ -724,6 +798,71 @@ impl LanguageServer for Mql5Lsp {
         }
     }
 
+    // ── Semantic Tokens ──
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+        let source = match self.get_source(uri) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let tree = match parser::parse(&source) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let idents = parser::extract_identifiers_scoped(&source, &tree);
+        let index = self.index.read().await;
+
+        let mut tokens: Vec<(u32, u32, u32, u32, u32)> = Vec::new(); // (line, col, len, type, modifiers)
+
+        for id in &idents {
+            let len = id.end_col - id.start_col;
+            if len == 0 { continue; }
+
+            // Classify the identifier
+            let (token_type, modifiers) = classify_identifier(&id.name, &id.scope, &index);
+
+            // Skip unclassified identifiers (they get tree-sitter highlighting)
+            if token_type == u32::MAX { continue; }
+
+            tokens.push((id.line, id.start_col, len, token_type, modifiers));
+        }
+
+        // Sort by position
+        tokens.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        // Encode as delta-encoded semantic tokens
+        let mut data = Vec::with_capacity(tokens.len() * 5);
+        let mut prev_line = 0u32;
+        let mut prev_col = 0u32;
+
+        for (line, col, len, token_type, modifiers) in &tokens {
+            let delta_line = line - prev_line;
+            let delta_col = if delta_line == 0 { col - prev_col } else { *col };
+
+            data.push(SemanticToken {
+                delta_line,
+                delta_start: delta_col,
+                length: *len,
+                token_type: *token_type,
+                token_modifiers_bitset: *modifiers,
+            });
+
+            prev_line = *line;
+            prev_col = *col;
+        }
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
+    }
+
     // ── Document Colors ──
 
     async fn document_color(&self, params: DocumentColorParams) -> Result<Vec<ColorInformation>> {
@@ -782,6 +921,29 @@ impl LanguageServer for Mql5Lsp {
                         },
                     });
                     i = name_end;
+                    continue;
+                }
+            }
+
+            // Hex color literals: 0xRRGGBB or 0xAARRGGBB
+            if bytes[i..].starts_with(b"0x") || bytes[i..].starts_with(b"0X") {
+                if let Some((r, g, b, a, hex_end)) = parse_hex_color(&source, i) {
+                    let (start_line, start_col) = byte_to_position(&source, i);
+                    let (end_line, end_col) = byte_to_position(&source, hex_end);
+
+                    colors.push(ColorInformation {
+                        range: Range {
+                            start: Position { line: start_line, character: start_col },
+                            end: Position { line: end_line, character: end_col },
+                        },
+                        color: Color {
+                            red: r as f32 / 255.0,
+                            green: g as f32 / 255.0,
+                            blue: b as f32 / 255.0,
+                            alpha: a as f32 / 255.0,
+                        },
+                    });
+                    i = hex_end;
                     continue;
                 }
             }
@@ -957,10 +1119,21 @@ impl Mql5Lsp {
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
         // (a) Syntax errors from tree-sitter ERROR/MISSING nodes
-        // DISABLED: tree-sitter-mql5 is based on C++ grammar, which marks
-        // many valid MQL5 constructs as errors (color literals C'r,g,b',
-        // dynamic arrays type arr[], reference arrays type& arr[], dot on
-        // pointers, etc.). Re-enable when we have a proper MQL5 grammar.
+        {
+            let errors = parser::extract_errors(&source, &tree);
+            for err in errors {
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position { line: err.start_line, character: err.start_col },
+                        end: Position { line: err.end_line, character: err.end_col },
+                    },
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("mql5-lsp".to_string()),
+                    message: err.message,
+                    ..Default::default()
+                });
+            }
+        }
 
         // (b) Unresolved includes
         {
@@ -1361,6 +1534,82 @@ fn make_hover(value: String) -> Hover {
     }
 }
 
+/// Classify an identifier for semantic token highlighting.
+/// Returns (token_type_index, modifier_bitset). u32::MAX means skip.
+fn classify_identifier(name: &str, scope: &str, index: &SymbolIndex) -> (u32, u32) {
+    const TY_VARIABLE: u32 = 0;
+    const _TY_PARAMETER: u32 = 1;
+    const TY_FUNCTION: u32 = 2;
+    const TY_METHOD: u32 = 3;
+    const TY_PROPERTY: u32 = 4;
+    const TY_CLASS: u32 = 5;
+    const TY_ENUM: u32 = 6;
+    const TY_ENUM_MEMBER: u32 = 7;
+    const TY_MACRO: u32 = 8;
+    const _TY_TYPE: u32 = 9;
+    const MOD_BUILTIN: u32 = 1 << 4; // DEFAULT_LIBRARY
+
+    // Skip keywords and types — tree-sitter handles these
+    if matches!(name,
+        "if" | "else" | "for" | "while" | "do" | "switch" | "case" | "default"
+        | "return" | "break" | "continue" | "void" | "int" | "double" | "float"
+        | "bool" | "char" | "string" | "long" | "short" | "uchar" | "ushort"
+        | "uint" | "ulong" | "datetime" | "color" | "true" | "false" | "NULL"
+        | "class" | "struct" | "enum" | "virtual" | "override" | "const" | "static"
+        | "public" | "private" | "protected" | "new" | "delete" | "this" | "sizeof"
+        | "input" | "sinput" | "template" | "typename" | "extern" | "typedef"
+    ) {
+        return (u32::MAX, 0);
+    }
+
+    // Check builtins
+    if find_function(name).is_some() {
+        return (TY_FUNCTION, MOD_BUILTIN);
+    }
+    if find_enum(name).is_some() {
+        return (TY_ENUM, MOD_BUILTIN);
+    }
+    if find_struct(name).is_some() {
+        return (TY_CLASS, MOD_BUILTIN);
+    }
+    // Check enum values across all enums
+    for e in BUILTIN_ENUMS {
+        if e.values.contains(&name) {
+            return (TY_ENUM_MEMBER, MOD_BUILTIN);
+        }
+    }
+    if find_constant(name).is_some() {
+        return (TY_MACRO, MOD_BUILTIN);
+    }
+
+    // Check workspace symbols
+    if let Some(sym) = index.find_symbol(name) {
+        return match sym.kind {
+            parser::ParsedSymbolKind::Function => (TY_FUNCTION, 0),
+            parser::ParsedSymbolKind::Method => (TY_METHOD, 0),
+            parser::ParsedSymbolKind::Class => (TY_CLASS, 0),
+            parser::ParsedSymbolKind::Struct => (TY_CLASS, 0),
+            parser::ParsedSymbolKind::Enum => (TY_ENUM, 0),
+            parser::ParsedSymbolKind::EnumValue => (TY_ENUM_MEMBER, 0),
+            parser::ParsedSymbolKind::Define => (TY_MACRO, 0),
+            parser::ParsedSymbolKind::InputVar => (TY_PROPERTY, 0),
+            parser::ParsedSymbolKind::Field => (TY_PROPERTY, 0),
+            parser::ParsedSymbolKind::GlobalVar => (TY_VARIABLE, 0),
+            parser::ParsedSymbolKind::TypeAlias => (TY_CLASS, 0),
+        };
+    }
+
+    // Local variable (not found globally, has a function scope)
+    if scope != "global" && !name.is_empty() {
+        if name.chars().next().is_some_and(|c| c.is_lowercase()) {
+            return (TY_VARIABLE, 0);
+        }
+    }
+
+    // Skip — let tree-sitter handle it
+    (u32::MAX, 0)
+}
+
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
@@ -1412,6 +1661,54 @@ fn parse_color_literal_at(bytes: &[u8], start: usize) -> Option<(u8, u8, u8, usi
         i += 1;
     }
     None
+}
+
+/// Parse hex color: 0xRRGGBB (6 digits) or 0xAARRGGBB (8 digits).
+/// Returns (r, g, b, a, end_byte_offset). Only matches exactly 6 or 8 hex digits.
+fn parse_hex_color(source: &str, start: usize) -> Option<(u8, u8, u8, u8, usize)> {
+    let rest = &source[start..];
+    if !rest.starts_with("0x") && !rest.starts_with("0X") {
+        return None;
+    }
+
+    let hex_start = start + 2;
+    let hex_bytes = source[hex_start..].as_bytes();
+    let mut hex_len = 0;
+    while hex_len < hex_bytes.len() && hex_bytes[hex_len].is_ascii_hexdigit() {
+        hex_len += 1;
+    }
+
+    // Only match 6 (RRGGBB) or 8 (AARRGGBB) hex digits
+    // Don't match if followed by more alphanumeric chars (it's a different constant)
+    if hex_len != 6 && hex_len != 8 {
+        return None;
+    }
+    if hex_start + hex_len < source.len() {
+        let next = source.as_bytes()[hex_start + hex_len];
+        if next.is_ascii_alphanumeric() || next == b'_' {
+            return None; // Part of a larger identifier/number
+        }
+    }
+
+    let hex_str = &source[hex_start..hex_start + hex_len];
+    let value = u32::from_str_radix(hex_str, 16).ok()?;
+
+    let (r, g, b, a) = if hex_len == 8 {
+        // 0xAARRGGBB
+        let a = ((value >> 24) & 0xFF) as u8;
+        let r = ((value >> 16) & 0xFF) as u8;
+        let g = ((value >> 8) & 0xFF) as u8;
+        let b = (value & 0xFF) as u8;
+        (r, g, b, a)
+    } else {
+        // 0xRRGGBB
+        let r = ((value >> 16) & 0xFF) as u8;
+        let g = ((value >> 8) & 0xFF) as u8;
+        let b = (value & 0xFF) as u8;
+        (r, g, b, 255)
+    };
+
+    Some((r, g, b, a, hex_start + hex_len))
 }
 
 /// Expected argument count range for a function.
@@ -1476,50 +1773,163 @@ fn count_signature_params(signature: &str) -> ExpectedArgs {
     }
 }
 
-/// Parse a named MQL5 color constant like clrRed, clrBlue.
+/// Parse a named MQL5 color constant (full web/X11 color set).
 /// Returns (r, g, b, end_byte_offset)
 fn parse_named_color(source: &str, start: usize) -> Option<(u8, u8, u8, usize)> {
     let rest = &source[start..];
-    // Extract the identifier
     let end = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_').unwrap_or(rest.len());
     let name = &rest[..end];
 
     let (r, g, b) = match name {
+        // Reds
         "clrRed" => (255, 0, 0),
-        "clrGreen" => (0, 128, 0),
-        "clrBlue" => (0, 0, 255),
-        "clrWhite" => (255, 255, 255),
-        "clrBlack" => (0, 0, 0),
-        "clrYellow" => (255, 255, 0),
-        "clrMagenta" => (255, 0, 255),
-        "clrCyan" => (0, 255, 255),
-        "clrOrange" => (255, 165, 0),
-        "clrPink" => (255, 192, 203),
-        "clrGray" | "clrGrey" => (128, 128, 128),
-        "clrSilver" => (192, 192, 192),
-        "clrGold" => (255, 215, 0),
-        "clrLime" => (0, 255, 0),
-        "clrAqua" => (0, 255, 255),
-        "clrMaroon" => (128, 0, 0),
-        "clrNavy" => (0, 0, 128),
-        "clrOlive" => (128, 128, 0),
-        "clrPurple" => (128, 0, 128),
-        "clrTeal" => (0, 128, 128),
-        "clrDarkGreen" => (0, 100, 0),
-        "clrDarkBlue" => (0, 0, 139),
         "clrDarkRed" => (139, 0, 0),
-        "clrDarkGray" | "clrDarkGrey" => (169, 169, 169),
-        "clrLightGray" | "clrLightGrey" => (211, 211, 211),
+        "clrIndianRed" => (205, 92, 92),
+        "clrLightCoral" => (240, 128, 128),
+        "clrSalmon" => (250, 128, 114),
+        "clrDarkSalmon" => (233, 150, 122),
+        "clrLightSalmon" => (255, 160, 122),
+        "clrCrimson" => (220, 20, 60),
+        "clrFireBrick" => (178, 34, 34),
+        // Pinks
+        "clrPink" => (255, 192, 203),
+        "clrLightPink" => (255, 182, 193),
+        "clrHotPink" => (255, 105, 180),
+        "clrDeepPink" => (255, 20, 147),
+        "clrMediumVioletRed" => (199, 21, 133),
+        "clrPaleVioletRed" => (219, 112, 147),
+        // Oranges
+        "clrOrange" => (255, 165, 0),
+        "clrDarkOrange" => (255, 140, 0),
+        "clrOrangeRed" => (255, 69, 0),
+        "clrTomato" => (255, 99, 71),
+        "clrCoral" => (255, 127, 80),
+        // Yellows
+        "clrYellow" => (255, 255, 0),
+        "clrLightYellow" => (255, 255, 224),
+        "clrLemonChiffon" => (255, 250, 205),
+        "clrLightGoldenrodYellow" => (250, 250, 210),
+        "clrPapayaWhip" => (255, 239, 213),
+        "clrMoccasin" => (255, 228, 181),
+        "clrPeachPuff" => (255, 218, 185),
+        "clrPaleGoldenrod" => (238, 232, 170),
+        "clrKhaki" => (240, 230, 140),
+        "clrDarkKhaki" => (189, 183, 107),
+        "clrGold" => (255, 215, 0),
+        // Purples
+        "clrLavender" => (230, 230, 250),
+        "clrThistle" => (216, 191, 216),
+        "clrPlum" => (221, 160, 221),
+        "clrViolet" => (238, 130, 238),
+        "clrOrchid" => (218, 112, 214),
+        "clrFuchsia" | "clrMagenta" => (255, 0, 255),
+        "clrMediumOrchid" => (186, 85, 211),
+        "clrMediumPurple" => (147, 112, 219),
+        "clrBlueViolet" => (138, 43, 226),
+        "clrDarkViolet" => (148, 0, 211),
+        "clrDarkOrchid" => (153, 50, 204),
+        "clrDarkMagenta" => (139, 0, 139),
+        "clrPurple" => (128, 0, 128),
+        "clrRebeccaPurple" => (102, 51, 153),
+        "clrIndigo" => (75, 0, 130),
+        "clrMediumSlateBlue" => (123, 104, 238),
+        "clrSlateBlue" => (106, 90, 205),
+        "clrDarkSlateBlue" => (72, 61, 139),
+        // Greens
+        "clrGreen" => (0, 128, 0),
+        "clrLime" => (0, 255, 0),
+        "clrLimeGreen" => (50, 205, 50),
+        "clrLawnGreen" => (124, 252, 0),
+        "clrChartreuse" => (127, 255, 0),
+        "clrGreenYellow" => (173, 255, 47),
+        "clrSpringGreen" => (0, 255, 127),
+        "clrMediumSpringGreen" => (0, 250, 154),
+        "clrLightGreen" => (144, 238, 144),
+        "clrPaleGreen" => (152, 251, 152),
+        "clrDarkSeaGreen" => (143, 188, 143),
+        "clrMediumSeaGreen" => (60, 179, 113),
+        "clrSeaGreen" => (46, 139, 87),
+        "clrForestGreen" => (34, 139, 34),
+        "clrDarkGreen" => (0, 100, 0),
+        "clrYellowGreen" => (154, 205, 50),
+        "clrOliveDrab" => (107, 142, 35),
+        "clrOlive" => (128, 128, 0),
+        "clrDarkOliveGreen" => (85, 107, 47),
+        "clrMediumAquamarine" => (102, 205, 170),
+        "clrDarkCyan" => (0, 139, 139),
+        "clrTeal" => (0, 128, 128),
+        // Blues
+        "clrBlue" => (0, 0, 255),
+        "clrAqua" | "clrCyan" => (0, 255, 255),
+        "clrLightCyan" => (224, 255, 255),
+        "clrPaleTurquoise" => (175, 238, 238),
+        "clrAquamarine" => (127, 255, 212),
+        "clrTurquoise" => (64, 224, 208),
+        "clrMediumTurquoise" => (72, 209, 204),
+        "clrDarkTurquoise" => (0, 206, 209),
+        "clrCadetBlue" => (95, 158, 160),
+        "clrSteelBlue" => (70, 130, 180),
+        "clrLightSteelBlue" => (176, 196, 222),
+        "clrPowderBlue" => (176, 224, 230),
+        "clrLightBlue" => (173, 216, 230),
+        "clrSkyBlue" => (135, 206, 235),
+        "clrLightSkyBlue" => (135, 206, 250),
+        "clrDeepSkyBlue" => (0, 191, 255),
         "clrDodgerBlue" => (30, 144, 255),
         "clrCornflowerBlue" => (100, 149, 237),
         "clrRoyalBlue" => (65, 105, 225),
-        "clrTomato" => (255, 99, 71),
-        "clrCoral" => (255, 127, 80),
-        "clrSalmon" => (250, 128, 114),
+        "clrMediumBlue" => (0, 0, 205),
+        "clrDarkBlue" => (0, 0, 139),
+        "clrNavy" => (0, 0, 128),
+        "clrMidnightBlue" => (25, 25, 112),
+        // Browns
+        "clrCornsilk" => (255, 248, 220),
+        "clrBlanchedAlmond" => (255, 235, 205),
+        "clrBisque" => (255, 228, 196),
+        "clrNavajoWhite" => (255, 222, 173),
+        "clrWheat" => (245, 222, 179),
+        "clrBurlyWood" => (222, 184, 135),
+        "clrTan" => (210, 180, 140),
+        "clrRosyBrown" => (188, 143, 143),
+        "clrSandyBrown" => (244, 164, 96),
+        "clrGoldenrod" => (218, 165, 32),
+        "clrDarkGoldenrod" => (184, 134, 11),
+        "clrPeru" => (205, 133, 63),
         "clrChocolate" => (210, 105, 30),
+        "clrSaddleBrown" => (139, 69, 19),
         "clrSienna" => (160, 82, 45),
-        "clrKhaki" => (240, 230, 140),
-        "clrNONE" => return None, // transparent — no color to show
+        "clrBrown" => (165, 42, 42),
+        "clrMaroon" => (128, 0, 0),
+        // Whites
+        "clrWhite" => (255, 255, 255),
+        "clrSnow" => (255, 250, 250),
+        "clrHoneydew" => (240, 255, 240),
+        "clrMintCream" => (245, 255, 250),
+        "clrAzure" => (240, 255, 255),
+        "clrAliceBlue" => (240, 248, 255),
+        "clrGhostWhite" => (248, 248, 255),
+        "clrWhiteSmoke" => (245, 245, 245),
+        "clrSeashell" => (255, 245, 238),
+        "clrBeige" => (245, 245, 220),
+        "clrOldLace" => (253, 245, 230),
+        "clrFloralWhite" => (255, 250, 240),
+        "clrIvory" => (255, 255, 240),
+        "clrAntiqueWhite" => (250, 235, 215),
+        "clrLinen" => (250, 240, 230),
+        "clrLavenderBlush" => (255, 240, 245),
+        "clrMistyRose" => (255, 228, 225),
+        // Grays
+        "clrBlack" => (0, 0, 0),
+        "clrGainsboro" => (220, 220, 220),
+        "clrLightGray" | "clrLightGrey" => (211, 211, 211),
+        "clrSilver" => (192, 192, 192),
+        "clrDarkGray" | "clrDarkGrey" => (169, 169, 169),
+        "clrGray" | "clrGrey" => (128, 128, 128),
+        "clrDimGray" | "clrDimGrey" => (105, 105, 105),
+        "clrLightSlateGray" | "clrLightSlateGrey" => (119, 136, 153),
+        "clrSlateGray" | "clrSlateGrey" => (112, 128, 144),
+        "clrDarkSlateGray" | "clrDarkSlateGrey" => (47, 79, 79),
+        "clrNONE" => return None,
         _ => return None,
     };
     Some((r, g, b, start + end))

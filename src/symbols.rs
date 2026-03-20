@@ -62,6 +62,8 @@ pub struct ReferenceInfo {
     pub name: String,
     pub uri: Url,
     pub range: Range,
+    /// The enclosing scope
+    pub scope: String,
 }
 
 /// Workspace-wide symbol index.
@@ -105,23 +107,24 @@ impl SymbolIndex {
             self.files.insert(path.to_path_buf(), symbols);
         }
 
-        // Extract identifier references (usages)
-        let idents = parser::extract_identifiers(source, &tree);
+        // Extract identifier references (usages) with scope tracking
+        let idents = parser::extract_identifiers_scoped(source, &tree);
         let refs: Vec<ReferenceInfo> = idents
             .into_iter()
-            .map(|(name, row, col, end_col)| ReferenceInfo {
-                name,
+            .map(|id| ReferenceInfo {
+                name: id.name,
                 uri: uri.clone(),
                 range: Range {
                     start: Position {
-                        line: row,
-                        character: col,
+                        line: id.line,
+                        character: id.start_col,
                     },
                     end: Position {
-                        line: row,
-                        character: end_col,
+                        line: id.line,
+                        character: id.end_col,
                     },
                 },
+                scope: id.scope,
             })
             .collect();
 
@@ -219,6 +222,28 @@ impl SymbolIndex {
             .flat_map(|v| v.iter())
             .filter(|r| r.name == name)
             .collect()
+    }
+
+    /// Find references in the same scope (for local variables).
+    /// Falls back to all references if scope is "global".
+    pub fn find_references_in_scope(&self, name: &str, scope: &str) -> Vec<&ReferenceInfo> {
+        if scope == "global" {
+            return self.find_references(name);
+        }
+        self.references
+            .values()
+            .flat_map(|v| v.iter())
+            .filter(|r| r.name == name && (r.scope == scope || r.scope == "global"))
+            .collect()
+    }
+
+    /// Get the scope of an identifier at a given location.
+    pub fn get_scope_at(&self, uri: &Url, line: u32, col: u32) -> Option<String> {
+        let path = uri.to_file_path().ok()?;
+        let refs = self.references.get(&path)?;
+        refs.iter()
+            .find(|r| r.range.start.line == line && r.range.start.character <= col && r.range.end.character >= col)
+            .map(|r| r.scope.clone())
     }
 
     /// Find all members of a class/struct.
