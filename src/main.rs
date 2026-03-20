@@ -831,7 +831,8 @@ impl Mql5Lsp {
                 }
 
                 // Check if it's a builtin function — verify argument count
-                if let Some(func) = find_function(&call.name) {
+                // Skip method calls since the same name may have different signatures
+                if let Some(func) = find_function(&call.name).filter(|_| !call.is_method) {
                     let expected = count_signature_params(func.signature);
                     // Only check if we have a definite expected count and call has args
                     if expected.min > 0 && call.arg_count < expected.min {
@@ -866,6 +867,10 @@ impl Mql5Lsp {
                     continue;
                 }
 
+                // Skip method calls — we can't reliably resolve receiver types
+                if call.is_method {
+                    continue;
+                }
                 // Skip known types/constants/enums
                 if find_enum(&call.name).is_some()
                     || find_struct(&call.name).is_some()
@@ -874,7 +879,7 @@ impl Mql5Lsp {
                 {
                     continue;
                 }
-                // Skip if found in workspace index
+                // Skip if found in workspace index (as definition or member)
                 if !index.find_symbols(&call.name).is_empty() {
                     continue;
                 }
@@ -1124,6 +1129,7 @@ struct ExpectedArgs {
 
 /// Count expected parameters from a signature like "void Foo(int a, string b = \"x\")".
 /// Parameters with `= default` are optional, reducing min count.
+/// Variadic `...` makes max unlimited (0).
 fn count_signature_params(signature: &str) -> ExpectedArgs {
     let start = match signature.find('(') {
         Some(p) => p + 1,
@@ -1139,6 +1145,11 @@ fn count_signature_params(signature: &str) -> ExpectedArgs {
 
     let params_str = &signature[start..end].trim();
     if params_str.is_empty() {
+        return ExpectedArgs { min: 0, max: 0 };
+    }
+
+    // Variadic functions — unlimited args
+    if params_str.contains("...") {
         return ExpectedArgs { min: 0, max: 0 };
     }
 

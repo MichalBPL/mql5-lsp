@@ -793,6 +793,8 @@ pub struct FunctionCall {
     pub line: u32,
     pub col: u32,
     pub arg_count: usize,
+    /// true if this is a method call (obj.Method())
+    pub is_method: bool,
 }
 
 /// Extract all function call sites from parsed source code.
@@ -821,6 +823,7 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                         line: start.row as u32,
                         col: start.column as u32,
                         arg_count,
+                        is_method: false,
                     });
                 }
                 "field_expression" => {
@@ -832,6 +835,7 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                             line: start.row as u32,
                             col: start.column as u32,
                             arg_count,
+                            is_method: true,
                         });
                     }
                 }
@@ -844,6 +848,7 @@ fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>)
                             line: start.row as u32,
                             col: start.column as u32,
                             arg_count,
+                            is_method: false,
                         });
                     }
                 }
