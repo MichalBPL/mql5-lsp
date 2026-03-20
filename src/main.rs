@@ -227,6 +227,11 @@ impl LanguageServer for Mql5Lsp {
             None => return Ok(None),
         };
 
+        // Don't complete inside strings or comments
+        if is_inside_string_or_comment(&source, line, col) {
+            return Ok(None);
+        }
+
         let context = parser::get_completion_context(&source, line, col);
         let mut items: Vec<CompletionItem> = Vec::new();
 
@@ -1626,6 +1631,48 @@ fn classify_identifier(name: &str, scope: &str, index: &SymbolIndex) -> (u32, u3
 
     // Skip — let tree-sitter handle it
     (u32::MAX, 0)
+}
+
+/// Check if cursor position is inside a string literal or comment.
+fn is_inside_string_or_comment(source: &str, line: usize, col: usize) -> bool {
+    let target_line = match source.lines().nth(line) {
+        Some(l) => l,
+        None => return false,
+    };
+    let before = if col <= target_line.len() { &target_line[..col] } else { target_line };
+
+    // Check for line comment: // before cursor
+    if let Some(slash_pos) = before.find("//") {
+        // Make sure it's not inside a string
+        let before_slash = &before[..slash_pos];
+        let quote_count = before_slash.chars().filter(|&c| c == '"').count();
+        if quote_count % 2 == 0 {
+            return true; // Inside line comment
+        }
+    }
+
+    // Check for string: count unescaped quotes before cursor
+    let mut in_string = false;
+    let mut prev_backslash = false;
+    for ch in before.chars() {
+        if ch == '"' && !prev_backslash {
+            in_string = !in_string;
+        }
+        prev_backslash = ch == '\\';
+    }
+    if in_string {
+        return true;
+    }
+
+    // Check for single-quoted char literal
+    let mut in_char = false;
+    for ch in before.chars() {
+        if ch == '\'' && !prev_backslash {
+            in_char = !in_char;
+        }
+        prev_backslash = ch == '\\';
+    }
+    in_char
 }
 
 fn is_ident_byte(b: u8) -> bool {
