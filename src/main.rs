@@ -731,25 +731,12 @@ impl Mql5Lsp {
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
         // (a) Syntax errors from tree-sitter ERROR/MISSING nodes
-        let errors = parser::extract_errors(&source, &tree);
-        for err in errors {
-            diagnostics.push(Diagnostic {
-                range: Range {
-                    start: Position {
-                        line: err.start_line,
-                        character: err.start_col,
-                    },
-                    end: Position {
-                        line: err.end_line,
-                        character: err.end_col,
-                    },
-                },
-                severity: Some(DiagnosticSeverity::ERROR),
-                source: Some("mql5-lsp".to_string()),
-                message: err.message,
-                ..Default::default()
-            });
-        }
+        // DISABLED: tree-sitter-mql5 is based on C++ grammar, which marks
+        // many valid MQL5 constructs as errors (color literals C'r,g,b',
+        // dynamic arrays type arr[], reference arrays type& arr[], dot on
+        // pointers, etc.). Re-enable when we have a proper MQL5 grammar.
+        // let errors = parser::extract_errors(&source, &tree);
+        // for err in errors { ... }
 
         // (c) Unresolved includes
         let includes = parser::extract_includes(&source, &tree);
