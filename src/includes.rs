@@ -25,7 +25,13 @@ impl IncludeResolver {
         }
     }
 
+    /// Get the MQL5 Include root directory, if detected.
+    pub fn include_root(&self) -> Option<&PathBuf> {
+        self.include_root.as_ref()
+    }
+
     /// Set the MQL5 Include root directory.
+    #[allow(dead_code)]
     pub fn set_include_root(&mut self, root: PathBuf) {
         self.include_root = Some(root);
     }
@@ -191,6 +197,7 @@ impl IncludeResolver {
     }
 
     /// Clear the resolution cache.
+    #[allow(dead_code)]
     pub fn clear_cache(&mut self) {
         self.cache.clear();
     }

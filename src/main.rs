@@ -43,9 +43,11 @@ impl LanguageServer for Mql5Lsp {
 
         if let Some(ref root) = workspace_root {
             // Detect MQL5 include root
+            let include_root;
             {
                 let mut resolver = self.include_resolver.write().await;
                 resolver.detect_include_root(root);
+                include_root = resolver.include_root().cloned();
             }
 
             // Index workspace files
@@ -53,10 +55,21 @@ impl LanguageServer for Mql5Lsp {
                 let mut index = self.index.write().await;
                 index.scan_directory(root);
                 log::info!(
-                    "Indexed {} files, {} symbols",
+                    "Workspace: {} files, {} symbols",
                     index.file_count(),
                     index.symbol_count()
                 );
+
+                // Also index MQL5 stdlib (Include/) for go-to-definition
+                // and autocomplete of standard library classes
+                if let Some(ref inc_root) = include_root {
+                    index.scan_directory(inc_root);
+                    log::info!(
+                        "After stdlib: {} files, {} symbols",
+                        index.file_count(),
+                        index.symbol_count()
+                    );
+                }
             }
         }
 
@@ -735,23 +748,47 @@ impl Mql5Lsp {
         // many valid MQL5 constructs as errors (color literals C'r,g,b',
         // dynamic arrays type arr[], reference arrays type& arr[], dot on
         // pointers, etc.). Re-enable when we have a proper MQL5 grammar.
-        // let errors = parser::extract_errors(&source, &tree);
-        // for err in errors { ... }
 
-        // (c) Unresolved includes
-        // DISABLED: the include resolver has edge cases with relative paths
-        // in subdirectories and the second LSP instance for MQL5/Include/.
-        // Re-enable when include resolution is more robust.
-        // let includes = parser::extract_includes(&source, &tree);
-        // if let Ok(path) = uri.to_file_path() { ... }
+        // (b) Unresolved includes
+        {
+            let includes = parser::extract_includes(&source, &tree);
+            if let Ok(path) = uri.to_file_path() {
+                let mut resolver = self.include_resolver.write().await;
+                for inc in &includes {
+                    if resolver.resolve(inc, &path).is_none() {
+                        diagnostics.push(Diagnostic {
+                            range: Range {
+                                start: Position {
+                                    line: inc.line,
+                                    character: 0,
+                                },
+                                end: Position {
+                                    line: inc.line,
+                                    character: 1000,
+                                },
+                            },
+                            severity: Some(DiagnosticSeverity::ERROR),
+                            source: Some("mql5-lsp".to_string()),
+                            message: format!(
+                                "Unresolved include: {}",
+                                inc.path
+                            ),
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
 
-        // (d) Duplicate definitions within the same file
+        // (c) Duplicate definitions within the same file
         {
             let parsed = parser::extract_symbols(&source, &tree);
             let mut seen: HashMap<String, u32> = HashMap::new();
             for sym in &parsed {
                 // Only check top-level symbols (no parent) and non-methods
-                if sym.parent_name.is_none() {
+                if sym.parent_name.is_none()
+                    && !matches!(sym.kind, parser::ParsedSymbolKind::EnumValue)
+                {
                     if let Some(prev_line) = seen.get(&sym.name) {
                         diagnostics.push(Diagnostic {
                             range: Range {
@@ -777,6 +814,59 @@ impl Mql5Lsp {
                         seen.insert(sym.name.clone(), sym.start_line);
                     }
                 }
+            }
+        }
+
+        // (d) Undeclared function calls — check calls against builtins + workspace index
+        {
+            let calls = parser::extract_function_calls(&source, &tree);
+            let index = self.index.read().await;
+            for call in &calls {
+                // Skip if it's a builtin
+                if find_function(&call.name).is_some() { continue; }
+                // Skip if it's a known keyword/type/constant
+                if find_enum(&call.name).is_some()
+                    || find_struct(&call.name).is_some()
+                    || find_constant(&call.name).is_some()
+                    || is_builtin_type(&call.name)
+                {
+                    continue;
+                }
+                // Skip C/C++ keywords that look like calls
+                if matches!(call.name.as_str(),
+                    "if" | "for" | "while" | "switch" | "return" | "else" | "do"
+                    | "sizeof" | "delete" | "new" | "typename" | "template"
+                ) {
+                    continue;
+                }
+                // Skip if found in workspace index (definitions)
+                if !index.find_symbols(&call.name).is_empty() {
+                    continue;
+                }
+                // Skip MQL5 event handlers
+                if call.name.starts_with("On") && MQL5_KEYWORDS.contains(&call.name.as_str()) {
+                    continue;
+                }
+
+                diagnostics.push(Diagnostic {
+                    range: Range {
+                        start: Position {
+                            line: call.line,
+                            character: call.col,
+                        },
+                        end: Position {
+                            line: call.line,
+                            character: call.col + call.name.len() as u32,
+                        },
+                    },
+                    severity: Some(DiagnosticSeverity::HINT),
+                    source: Some("mql5-lsp".to_string()),
+                    message: format!(
+                        "Unknown function `{}` — not in builtins or workspace index",
+                        call.name
+                    ),
+                    ..Default::default()
+                });
             }
         }
 

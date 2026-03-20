@@ -28,6 +28,7 @@ pub fn parse(source: &str) -> Option<Tree> {
 }
 
 /// Incremental parse with an old tree.
+#[allow(dead_code)]
 pub fn parse_incremental(source: &str, old_tree: &Tree) -> Option<Tree> {
     let mut parser = new_parser();
     parser.parse(source, Some(old_tree))
@@ -47,6 +48,7 @@ pub struct ParsedSymbol {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(dead_code)]
 pub enum ParsedSymbolKind {
     Function,
     Class,
@@ -205,7 +207,7 @@ fn extract_declaration(
     }
 
     // Check for function declarations (not definitions — no body)
-    if let Some(declarator) = find_child_by_kind(node, "function_declarator") {
+    if let Some(_declarator) = find_child_by_kind(node, "function_declarator") {
         if let Some(sym) = extract_function(node, source, parent_class) {
             symbols.push(sym);
         }
@@ -596,9 +598,76 @@ fn collect_identifiers(node: Node, source: &str, out: &mut Vec<(String, u32, u32
     }
 }
 
+// ── Function call extraction (for diagnostics) ──
+
+/// A function call site found in source code.
+#[derive(Clone, Debug)]
+pub struct FunctionCall {
+    pub name: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Extract all function call sites from parsed source code.
+pub fn extract_function_calls(source: &str, tree: &Tree) -> Vec<FunctionCall> {
+    let mut calls = Vec::new();
+    collect_function_calls(tree.root_node(), source, &mut calls);
+    calls
+}
+
+fn collect_function_calls(node: Node, source: &str, out: &mut Vec<FunctionCall>) {
+    if node.kind() == "call_expression" {
+        // The function name is the first child (usually an identifier or field_expression)
+        if let Some(func_node) = node.child(0) {
+            match func_node.kind() {
+                "identifier" => {
+                    let name = &source[func_node.byte_range()];
+                    let start = func_node.start_position();
+                    out.push(FunctionCall {
+                        name: name.to_string(),
+                        line: start.row as u32,
+                        col: start.column as u32,
+                    });
+                }
+                "field_expression" => {
+                    // obj.Method() — extract the method name
+                    if let Some(field) = find_child_by_kind(func_node, "field_identifier") {
+                        let name = &source[field.byte_range()];
+                        let start = field.start_position();
+                        out.push(FunctionCall {
+                            name: name.to_string(),
+                            line: start.row as u32,
+                            col: start.column as u32,
+                        });
+                    }
+                }
+                "qualified_identifier" => {
+                    // Scope::Function() — extract the function name part
+                    let text = &source[func_node.byte_range()];
+                    if let Some(last_part) = text.rsplit("::").next() {
+                        let start = func_node.start_position();
+                        out.push(FunctionCall {
+                            name: last_part.to_string(),
+                            line: start.row as u32,
+                            col: start.column as u32,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_function_calls(child, source, out);
+    }
+}
+
 // ── Error node extraction (for diagnostics) ──
 
 /// A syntax error found by tree-sitter.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct SyntaxError {
     pub message: String,
@@ -609,12 +678,14 @@ pub struct SyntaxError {
 }
 
 /// Extract all ERROR and MISSING nodes from the parse tree.
+#[allow(dead_code)]
 pub fn extract_errors(source: &str, tree: &Tree) -> Vec<SyntaxError> {
     let mut errors = Vec::new();
     collect_errors(tree.root_node(), source, &mut errors);
     errors
 }
 
+#[allow(dead_code)]
 fn collect_errors(node: Node, source: &str, out: &mut Vec<SyntaxError>) {
     if node.is_error() {
         let text = &source[node.byte_range()];
@@ -692,5 +763,106 @@ void OnTick() {
             get_completion_context("   int x = ", 0, 11),
             CompletionContext::General
         );
+    }
+
+    #[test]
+    fn test_extract_class_with_members() {
+        let source = "class CMyClass { public: int m_value; void SetValue(int val) { } int GetValue() { return 0; } };";
+        let tree = parse(source).unwrap();
+        let symbols = extract_symbols(source, &tree);
+
+        assert!(symbols.iter().any(|s| s.name == "CMyClass" && s.kind == ParsedSymbolKind::Class));
+        assert!(symbols.iter().any(|s| s.name == "m_value" && s.kind == ParsedSymbolKind::Field));
+        assert!(symbols.iter().any(|s| s.name == "SetValue" && s.kind == ParsedSymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "GetValue" && s.kind == ParsedSymbolKind::Method));
+
+        // Check parent names
+        let method = symbols.iter().find(|s| s.name == "SetValue").unwrap();
+        assert_eq!(method.parent_name.as_deref(), Some("CMyClass"));
+    }
+
+    #[test]
+    fn test_extract_enum() {
+        let source = r#"
+enum ENUM_MY_TYPE {
+    MY_TYPE_A,
+    MY_TYPE_B,
+    MY_TYPE_C
+};
+"#;
+        let tree = parse(source).unwrap();
+        let symbols = extract_symbols(source, &tree);
+
+        assert!(symbols.iter().any(|s| s.name == "ENUM_MY_TYPE" && s.kind == ParsedSymbolKind::Enum));
+        assert!(symbols.iter().any(|s| s.name == "MY_TYPE_A" && s.kind == ParsedSymbolKind::EnumValue));
+        assert!(symbols.iter().any(|s| s.name == "MY_TYPE_B" && s.kind == ParsedSymbolKind::EnumValue));
+        assert_eq!(symbols.iter().filter(|s| s.kind == ParsedSymbolKind::EnumValue).count(), 3);
+    }
+
+    #[test]
+    fn test_extract_define() {
+        let source = r#"
+#define MY_CONSTANT 42
+#define MY_MACRO(x) ((x) * 2)
+"#;
+        let tree = parse(source).unwrap();
+        let symbols = extract_symbols(source, &tree);
+
+        assert!(symbols.iter().any(|s| s.name == "MY_CONSTANT" && s.kind == ParsedSymbolKind::Define));
+        assert!(symbols.iter().any(|s| s.name == "MY_MACRO" && s.kind == ParsedSymbolKind::Define));
+    }
+
+    #[test]
+    fn test_extract_input_vars() {
+        let source = r#"
+input int    InpMagicNumber = 12345;
+input double InpLotSize     = 0.01;
+sinput bool  InpDebug       = false;
+"#;
+        let tree = parse(source).unwrap();
+        let symbols = extract_symbols(source, &tree);
+
+        assert!(symbols.iter().any(|s| s.name == "InpMagicNumber" && s.kind == ParsedSymbolKind::InputVar));
+        assert!(symbols.iter().any(|s| s.name == "InpLotSize" && s.kind == ParsedSymbolKind::InputVar));
+        assert!(symbols.iter().any(|s| s.name == "InpDebug" && s.kind == ParsedSymbolKind::InputVar));
+    }
+
+    #[test]
+    fn test_extract_function_calls() {
+        let source = r#"
+void OnTick() {
+    Print("Hello");
+    int size = ArraySize(rates);
+    chart.Redraw();
+}
+"#;
+        let tree = parse(source).unwrap();
+        let calls = extract_function_calls(source, &tree);
+
+        assert!(calls.iter().any(|c| c.name == "Print"));
+        assert!(calls.iter().any(|c| c.name == "ArraySize"));
+        assert!(calls.iter().any(|c| c.name == "Redraw"));
+    }
+
+    #[test]
+    fn test_extract_identifiers() {
+        let source = r#"
+int x = 42;
+void Foo() { Print(x); }
+"#;
+        let tree = parse(source).unwrap();
+        let idents = extract_identifiers(source, &tree);
+
+        assert!(idents.iter().any(|(name, _, _, _)| name == "x"));
+        assert!(idents.iter().any(|(name, _, _, _)| name == "Foo"));
+        assert!(idents.iter().any(|(name, _, _, _)| name == "Print"));
+    }
+
+    #[test]
+    fn test_extract_word_at() {
+        let source = "int myVariable = 42;";
+        assert_eq!(extract_word_at(source, 0, 5), Some("myVariable".to_string()));
+        assert_eq!(extract_word_at(source, 0, 0), Some("int".to_string()));
+        assert_eq!(extract_word_at(source, 0, 17), Some("42".to_string()));
     }
 }

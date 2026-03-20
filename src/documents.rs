@@ -70,6 +70,7 @@ impl DocumentStore {
     }
 
     /// Get a specific line from a document.
+    #[allow(dead_code)]
     pub fn get_line(&self, uri: &Url, line: usize) -> Option<String> {
         self.docs.get(uri).and_then(|doc| {
             if line < doc.rope.len_lines() {
@@ -81,6 +82,7 @@ impl DocumentStore {
     }
 
     /// Check if a document is tracked (open in editor).
+    #[allow(dead_code)]
     pub fn is_open(&self, uri: &Url) -> bool {
         self.docs.contains_key(uri)
     }
