@@ -99,6 +99,7 @@ impl IncludeResolver {
             // System include: look in MQL5/Include/
             if let Some(ref root) = self.include_root {
                 let resolved = root.join(&normalized_path);
+                log::debug!("System include {:?} -> {:?} exists={}", normalized_path, resolved.display(), resolved.is_file());
                 if resolved.is_file() {
                     return Some(resolved);
                 }
@@ -107,6 +108,7 @@ impl IncludeResolver {
             // Local include: look relative to source file's directory
             if let Some(source_dir) = source_file.parent() {
                 let resolved = source_dir.join(&normalized_path);
+                log::debug!("Local include {:?} dir={:?} -> {:?} exists={}", normalized_path, source_dir.display(), resolved.display(), resolved.is_file());
                 if resolved.is_file() {
                     return Some(resolved);
                 }

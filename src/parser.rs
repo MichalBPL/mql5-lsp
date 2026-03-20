@@ -452,14 +452,20 @@ fn parse_include_line(line: &str, line_num: u32) -> Option<IncludeDirective> {
     let after_include = line.strip_prefix("#include")?.trim();
 
     if after_include.starts_with('<') {
-        let path = after_include.trim_start_matches('<').trim_end_matches('>');
+        // Extract between < and first >
+        let start = 1; // skip '<'
+        let end = after_include.find('>')?;
+        let path = &after_include[start..end];
         Some(IncludeDirective {
             path: path.replace('\\', "/"),
             is_system: true,
             line: line_num,
         })
     } else if after_include.starts_with('"') {
-        let path = after_include.trim_matches('"');
+        // Extract between first " and second "
+        let start = 1; // skip opening '"'
+        let end = after_include[start..].find('"')? + start;
+        let path = &after_include[start..end];
         Some(IncludeDirective {
             path: path.replace('\\', "/"),
             is_system: false,
