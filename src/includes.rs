@@ -115,6 +115,27 @@ impl IncludeResolver {
             }
         }
 
+        // Last resort for both system and local: walk up from source file
+        // looking for the file. Handles cases where include root detection
+        // fails (e.g., paths with spaces on macOS).
+        if let Some(mut dir) = source_file.parent().map(|p| p.to_path_buf()) {
+            for _ in 0..10 {
+                let candidate = dir.join(&normalized_path);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+                // Also check Include/ subdirectory at each level
+                let inc_candidate = dir.join("Include").join(&normalized_path);
+                if inc_candidate.is_file() {
+                    return Some(inc_candidate);
+                }
+                match dir.parent() {
+                    Some(p) => dir = p.to_path_buf(),
+                    None => break,
+                }
+            }
+        }
+
         None
     }
 
