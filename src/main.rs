@@ -1,5 +1,6 @@
 mod builtins;
 mod documents;
+mod formatter;
 mod includes;
 mod parser;
 mod symbols;
@@ -104,6 +105,7 @@ impl LanguageServer for Mql5Lsp {
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 color_provider: Some(ColorProviderCapability::Simple(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                         legend: SemanticTokensLegend {
@@ -776,14 +778,16 @@ impl LanguageServer for Mql5Lsp {
     // ── Code Actions ──
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
         let mut actions: Vec<CodeActionOrCommand> = Vec::new();
 
-        // Check if any diagnostic in range is an unresolved include
         for diag in &params.context.diagnostics {
-            if diag.source.as_deref() == Some("mql5-lsp")
-                && diag.message.starts_with("Unresolved include:")
-            {
-                // Suggest creating the file
+            if diag.source.as_deref() != Some("mql5-lsp") {
+                continue;
+            }
+
+            // Unresolved include → suggest creating file
+            if diag.message.starts_with("Unresolved include:") {
                 let include_path = diag.message.strip_prefix("Unresolved include: ").unwrap_or("");
                 if !include_path.is_empty() {
                     actions.push(CodeActionOrCommand::CodeAction(CodeAction {
@@ -794,6 +798,68 @@ impl LanguageServer for Mql5Lsp {
                     }));
                 }
             }
+
+            // Unknown function → suggest adding #include if found in another file
+            if diag.message.starts_with("Unknown function") {
+                let func_name = diag.message
+                    .strip_prefix("Unknown function `")
+                    .and_then(|s| s.split('`').next());
+
+                if let Some(func_name) = func_name {
+                    let index = self.index.read().await;
+                    if let Some(sym) = index.find_symbol(func_name) {
+                        // Compute relative include path
+                        if let (Ok(current_path), Ok(sym_path)) =
+                            (uri.to_file_path(), sym.uri.to_file_path())
+                        {
+                            if let Some(include_text) =
+                                compute_include_directive(&current_path, &sym_path)
+                            {
+                                // Find the line to insert (after last #include, or line 0)
+                                let insert_line = self
+                                    .get_source(uri)
+                                    .map(|s| find_include_insert_line(&s))
+                                    .unwrap_or(0);
+
+                                let mut changes = HashMap::new();
+                                changes.insert(
+                                    uri.clone(),
+                                    vec![TextEdit {
+                                        range: Range {
+                                            start: Position {
+                                                line: insert_line,
+                                                character: 0,
+                                            },
+                                            end: Position {
+                                                line: insert_line,
+                                                character: 0,
+                                            },
+                                        },
+                                        new_text: format!("{}\n", include_text),
+                                    }],
+                                );
+
+                                actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                                    title: format!(
+                                        "Add #include for `{}`",
+                                        sym_path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                    ),
+                                    kind: Some(CodeActionKind::QUICKFIX),
+                                    diagnostics: Some(vec![diag.clone()]),
+                                    edit: Some(WorkspaceEdit {
+                                        changes: Some(changes),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         if actions.is_empty() {
@@ -801,6 +867,43 @@ impl LanguageServer for Mql5Lsp {
         } else {
             Ok(Some(actions))
         }
+    }
+
+    // ── Document Formatting ──
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.get_source(uri) {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let formatted = formatter::format_mql5(&source);
+
+        if formatted == source {
+            return Ok(None); // No changes needed
+        }
+
+        // Replace entire document
+        let line_count = source.lines().count() as u32;
+        let last_line_len = source.lines().last().map(|l| l.len()).unwrap_or(0) as u32;
+
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: line_count,
+                    character: last_line_len,
+                },
+            },
+            new_text: formatted,
+        }]))
     }
 
     // ── Semantic Tokens ──
@@ -1419,7 +1522,7 @@ impl Mql5Lsp {
     }
 
     /// General completion — show all available symbols.
-    async fn complete_general(&self, _uri: &Url, items: &mut Vec<CompletionItem>) {
+    async fn complete_general(&self, uri: &Url, items: &mut Vec<CompletionItem>) {
         // Builtin functions
         for func in BUILTIN_FUNCTIONS {
             items.push(CompletionItem {
@@ -1494,19 +1597,72 @@ impl Mql5Lsp {
             });
         }
 
-        // Workspace symbols (skip current file's locals to avoid noise)
+        // Workspace symbols — with auto-import for symbols from other files
         let index = self.index.read().await;
+        let current_source = self.get_source(uri).unwrap_or_default();
+        let current_includes: Vec<String> = current_source
+            .lines()
+            .filter(|l| l.trim().starts_with("#include"))
+            .map(|l| l.to_string())
+            .collect();
+
         for sym in index.all_symbols() {
             // Skip members — they'll appear via dot completion
             if sym.parent_name.is_some() {
                 continue;
             }
-            items.push(CompletionItem {
+
+            let mut item = CompletionItem {
                 label: sym.name.clone(),
                 kind: Some(sym.completion_kind()),
                 detail: Some(sym.detail.clone()),
                 ..Default::default()
-            });
+            };
+
+            // If symbol is from a different file, check if we need to auto-import
+            if sym.uri != *uri {
+                if let (Ok(current_path), Ok(sym_path)) =
+                    (uri.to_file_path(), sym.uri.to_file_path())
+                {
+                    if let Some(include_text) =
+                        compute_include_directive(&current_path, &sym_path)
+                    {
+                        // Only add if not already included
+                        let already_included = current_includes.iter().any(|inc| {
+                            inc.contains(
+                                &sym_path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            )
+                        });
+
+                        if !already_included {
+                            let insert_line = find_include_insert_line(&current_source);
+                            item.additional_text_edits = Some(vec![TextEdit {
+                                range: Range {
+                                    start: Position {
+                                        line: insert_line,
+                                        character: 0,
+                                    },
+                                    end: Position {
+                                        line: insert_line,
+                                        character: 0,
+                                    },
+                                },
+                                new_text: format!("{}\n", include_text),
+                            }]);
+                            item.detail = Some(format!(
+                                "{} (auto-import)",
+                                sym.detail
+                            ));
+                        }
+                    }
+                }
+            }
+
+            items.push(item);
         }
     }
 
@@ -2123,6 +2279,66 @@ fn parse_signature_params(signature: &str) -> Vec<String> {
 
     params
 }
+
+/// Compute the #include directive to add for a target file, relative to the current file.
+fn compute_include_directive(current_file: &Path, target_file: &Path) -> Option<String> {
+    // Check if target is in the MQL5/Include/ tree → use angle brackets
+    let target_str = target_file.to_string_lossy();
+    if let Some(idx) = target_str.find("MQL5/Include/") {
+        let relative = &target_str[idx + "MQL5/Include/".len()..];
+        return Some(format!("#include <{}>", relative.replace('/', "\\")));
+    }
+
+    // Otherwise, compute relative path from current file's directory
+    let current_dir = current_file.parent()?;
+    let relative = pathdiff_relative(current_dir, target_file)?;
+    Some(format!("#include \"{}\"", relative))
+}
+
+/// Simple relative path computation (current_dir → target).
+fn pathdiff_relative(base: &Path, target: &Path) -> Option<String> {
+    // Try to make target relative to base
+    if let Ok(stripped) = target.strip_prefix(base) {
+        return Some(stripped.to_string_lossy().to_string());
+    }
+
+    // Walk up from base to find common ancestor
+    let base_components: Vec<_> = base.components().collect();
+    let target_components: Vec<_> = target.components().collect();
+
+    // Find common prefix length
+    let common_len = base_components
+        .iter()
+        .zip(target_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    if common_len == 0 {
+        return None;
+    }
+
+    let ups = base_components.len() - common_len;
+    let mut parts: Vec<String> = (0..ups).map(|_| "..".to_string()).collect();
+    for comp in &target_components[common_len..] {
+        parts.push(comp.as_os_str().to_string_lossy().to_string());
+    }
+
+    Some(parts.join("/"))
+}
+
+/// Find the line number after the last #include directive (or 0 if none).
+fn find_include_insert_line(source: &str) -> u32 {
+    let mut last_include_line = None;
+    for (i, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#include") {
+            last_include_line = Some(i as u32);
+        }
+    }
+    last_include_line.map(|l| l + 1).unwrap_or(0)
+}
+
+use std::path::Path;
 
 #[tokio::main]
 async fn main() {
