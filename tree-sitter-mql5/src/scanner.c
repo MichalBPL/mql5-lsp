@@ -5,7 +5,7 @@
 #include <string.h>
 #include <wctype.h>
 
-enum TokenType { RAW_STRING_DELIMITER, RAW_STRING_CONTENT };
+enum TokenType { RAW_STRING_DELIMITER, RAW_STRING_CONTENT, COLOR_LITERAL };
 
 /// The spec limits delimiters to 16 chars
 #define MAX_DELIMITER_LENGTH 16
@@ -94,6 +94,41 @@ static bool scan_raw_string_content(Scanner *scanner, TSLexer *lexer) {
     }
 }
 
+/// Scan MQL5 color literal: C'r,g,b' where r,g,b are 0-255
+/// Matches: C'255,0,128' or C'30,140,50'
+static bool scan_color_literal(TSLexer *lexer) {
+    // Lexer should be at 'C' (whitespace already skipped by caller)
+    if (lexer->lookahead != 'C') return false;
+    advance(lexer);
+
+    // Must be immediately followed by single quote (no space)
+    if (lexer->lookahead != '\'') return false;
+    advance(lexer);
+
+    // Scan digits, commas (expect r,g,b pattern)
+    int comma_count = 0;
+    bool has_digit = false;
+    for (;;) {
+        if (lexer->eof(lexer)) return false;
+        if (lexer->lookahead >= '0' && lexer->lookahead <= '9') {
+            has_digit = true;
+            advance(lexer);
+        } else if (lexer->lookahead == ',') {
+            if (!has_digit) return false;
+            comma_count++;
+            if (comma_count > 2) return false; // max 3 components
+            has_digit = false;
+            advance(lexer);
+        } else if (lexer->lookahead == '\'') {
+            if (!has_digit || comma_count != 2) return false; // must have exactly r,g,b
+            advance(lexer);
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+
 void *tree_sitter_mql5_external_scanner_create() {
     Scanner *scanner = (Scanner *)ts_calloc(1, sizeof(Scanner));
     memset(scanner, 0, sizeof(Scanner));
@@ -106,6 +141,20 @@ bool tree_sitter_mql5_external_scanner_scan(void *payload, TSLexer *lexer, const
     if (valid_symbols[RAW_STRING_DELIMITER] && valid_symbols[RAW_STRING_CONTENT]) {
         // we're in error recovery
         return false;
+    }
+
+    // MQL5 color literals: C'r,g,b' — must check before identifiers consume 'C'
+    if (valid_symbols[COLOR_LITERAL]) {
+        // Skip whitespace
+        while (lexer->lookahead == ' ' || lexer->lookahead == '\t' ||
+               lexer->lookahead == '\n' || lexer->lookahead == '\r') {
+            lexer->advance(lexer, true);
+        }
+        if (lexer->lookahead == 'C') {
+            lexer->result_symbol = COLOR_LITERAL;
+            bool result = scan_color_literal(lexer);
+            if (result) return true;
+        }
     }
 
     // No skipping leading whitespace: raw-string grammar is space-sensitive.
