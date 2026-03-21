@@ -2340,10 +2340,153 @@ fn find_include_insert_line(source: &str) -> u32 {
 
 use std::path::Path;
 
+/// Standalone diagnostic check mode — runs without LSP server.
+/// Used by compile.sh to pre-check files before MetaEditor.
+async fn run_check(files: Vec<String>) -> i32 {
+    use std::path::Path;
+
+    let mut resolver = IncludeResolver::new();
+    let index = SymbolIndex::new();
+    let mut total_errors = 0;
+    let mut total_warnings = 0;
+    let mut total_hints = 0;
+
+    // Detect include root from the first file's workspace
+    if let Some(first) = files.first() {
+        let p = std::fs::canonicalize(first).unwrap_or_else(|_| PathBuf::from(first));
+        resolver.detect_include_root(&p);
+    }
+
+    for file_path_str in &files {
+        let file_path = Path::new(file_path_str);
+        let source = match std::fs::read_to_string(file_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("  \x1b[31mERROR\x1b[0m {}: cannot read file: {}", file_path_str, e);
+                total_errors += 1;
+                continue;
+            }
+        };
+
+        let tree = match parser::parse(&source) {
+            Some(t) => t,
+            None => {
+                eprintln!("  \x1b[31mERROR\x1b[0m {}: failed to parse", file_path_str);
+                total_errors += 1;
+                continue;
+            }
+        };
+
+        let source_lines: Vec<&str> = source.lines().collect();
+
+        // (a) Syntax errors
+        let errors = parser::extract_errors(&source, &tree);
+        for err in &errors {
+            let line_text = source_lines.get(err.start_line as usize).unwrap_or(&"");
+            let trimmed = line_text.trim();
+            if trimmed.starts_with("input group") { continue; }
+            if trimmed.starts_with("sinput group") { continue; }
+            if trimmed.starts_with("#property") { continue; }
+            if trimmed.starts_with("#import") { continue; }
+            if trimmed.starts_with("#resource") { continue; }
+            if trimmed.contains("operator") && err.message.contains("Syntax error") { continue; }
+
+            eprintln!("  \x1b[31mERROR\x1b[0m {}:{}: {}", file_path_str, err.start_line + 1, err.message);
+            total_errors += 1;
+        }
+
+        // (b) Unresolved includes
+        let includes = parser::extract_includes(&source, &tree);
+        for inc in &includes {
+            if resolver.resolve(inc, file_path).is_none() {
+                eprintln!("  \x1b[31mERROR\x1b[0m {}:{}: Unresolved include: {}", file_path_str, inc.line + 1, inc.path);
+                total_errors += 1;
+            }
+        }
+
+        // (c) Duplicate definitions
+        let parsed = parser::extract_symbols(&source, &tree);
+        let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for sym in &parsed {
+            if sym.parent_name.is_none()
+                && !matches!(sym.kind, parser::ParsedSymbolKind::EnumValue)
+            {
+                if let Some(prev_line) = seen.get(&sym.name) {
+                    eprintln!("  \x1b[33mWARN\x1b[0m  {}:{}: Duplicate definition of `{}` (first on line {})",
+                        file_path_str, sym.start_line + 1, sym.name, prev_line + 1);
+                    total_warnings += 1;
+                } else {
+                    seen.insert(sym.name.clone(), sym.start_line);
+                }
+            }
+        }
+
+        // (d) Function call checks
+        let calls = parser::extract_function_calls(&source, &tree);
+        for call in &calls {
+            if matches!(call.name.as_str(),
+                "if" | "for" | "while" | "switch" | "return" | "else" | "do"
+                | "sizeof" | "delete" | "new" | "typename" | "template"
+            ) { continue; }
+
+            if let Some(func) = find_function(&call.name).filter(|_| !call.is_method) {
+                let expected = count_signature_params(func.signature);
+                if expected.min > 0 && call.arg_count < expected.min {
+                    eprintln!("  \x1b[33mWARN\x1b[0m  {}:{}: `{}` expects at least {} argument(s), got {}",
+                        file_path_str, call.line + 1, call.name, expected.min, call.arg_count);
+                    total_warnings += 1;
+                } else if expected.max > 0 && call.arg_count > expected.max {
+                    eprintln!("  \x1b[33mWARN\x1b[0m  {}:{}: `{}` expects at most {} argument(s), got {}",
+                        file_path_str, call.line + 1, call.name, expected.max, call.arg_count);
+                    total_warnings += 1;
+                }
+                continue;
+            }
+
+            if call.is_method { continue; }
+            if find_enum(&call.name).is_some()
+                || find_struct(&call.name).is_some()
+                || find_constant(&call.name).is_some()
+                || is_builtin_type(&call.name)
+            { continue; }
+            if !index.find_symbols(&call.name).is_empty() { continue; }
+            if call.name.starts_with("On") && MQL5_KEYWORDS.contains(&call.name.as_str()) { continue; }
+
+            total_hints += 1;
+        }
+    }
+
+    // Summary
+    if total_errors == 0 && total_warnings == 0 {
+        eprintln!("\n  \x1b[32m✓ Pre-check passed\x1b[0m ({} file(s), {} hint(s))", files.len(), total_hints);
+        0
+    } else if total_errors == 0 {
+        eprintln!("\n  \x1b[33m⚠ Pre-check: {} warning(s)\x1b[0m ({} file(s))", total_warnings, files.len());
+        0  // warnings don't block compile
+    } else {
+        eprintln!("\n  \x1b[31m✗ Pre-check failed: {} error(s), {} warning(s)\x1b[0m", total_errors, total_warnings);
+        1
+    }
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
 
+    let args: Vec<String> = std::env::args().collect();
+
+    // --check mode: run diagnostics on files and exit
+    if args.len() >= 2 && args[1] == "--check" {
+        let files: Vec<String> = args[2..].to_vec();
+        if files.is_empty() {
+            eprintln!("Usage: mql5-lsp --check <file1.mq5> [file2.mqh] ...");
+            std::process::exit(1);
+        }
+        let code = run_check(files).await;
+        std::process::exit(code);
+    }
+
+    // Normal LSP server mode
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
